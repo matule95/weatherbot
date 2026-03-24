@@ -89,7 +89,7 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
 <div class="header">
   <div>
     <div class="brand-title">WEATHER BOT — KELLY SIM</div>
-    <div class="brand-sub">Polymarket · Open-Meteo · Kelly Criterion · EV Analysis</div>
+    <div class="brand-sub">Polymarket · ECMWF / HRRR / METAR · Kelly · EV · data/markets/*.json</div>
   </div>
   <div class="header-right">
     <div class="live-pill"><div class="dot" id="status-dot"></div><span id="status-text">CONNECTING...</span></div>
@@ -98,15 +98,17 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
 </div>
 
 <div id="no-server-msg" class="no-server" style="display:none;margin-bottom:20px;">
-  ⚠️ &nbsp;Dashboard needs a local server to read <code>simulation.json</code>.<br>
+  ⚠️ &nbsp;Dashboard needs a local server to read <code>simulation.json</code> (written by <code>bot_v2.py</code> on each scan or <code>python bot_v2.py status</code>).<br>
   Run this command in your <code>weatherbot</code> folder, then refresh:<br><br>
   <code>python -m http.server 8000</code><br><br>
-  Then open: <code>http://localhost:8000/sim_dashboard.html</code>
+  Then open: <code>http://localhost:8000/sim_dashboard_repost.html</code>
 </div>
+
+<div id="scan-line" class="ts" style="margin:-8px 0 18px;letter-spacing:0.5px;display:none;"></div>
 
 <div class="stats">
   <div class="stat"><div class="stat-label">Balance</div><div class="stat-val" id="s-bal">—</div><div class="stat-sub">virtual USDC</div></div>
-  <div class="stat"><div class="stat-label">Total PnL</div><div class="stat-val" id="s-pnl">—</div><div class="stat-sub" id="s-pct">vs $1,000 start</div></div>
+  <div class="stat"><div class="stat-label">Total PnL</div><div class="stat-val" id="s-pnl">—</div><div class="stat-sub" id="s-pct">vs start</div></div>
   <div class="stat"><div class="stat-label">Open Positions</div><div class="stat-val" id="s-open">—</div><div class="stat-sub">active trades</div></div>
   <div class="stat"><div class="stat-label">Win Rate</div><div class="stat-val yellow" id="s-wr">—</div><div class="stat-sub" id="s-wl">0W / 0L</div></div>
   <div class="stat"><div class="stat-label">Total Trades</div><div class="stat-val" id="s-total">—</div><div class="stat-sub">all time</div></div>
@@ -132,7 +134,7 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
 <div class="bot-grid">
   <div class="panel">
     <div class="card-head"><span class="card-title">Trade History</span><span class="card-badge">FROM simulation.json</span></div>
-    <div class="scroll" id="trade-list"><div class="empty">No trades yet — run: python weather_bot_v2.py --live</div></div>
+    <div class="scroll" id="trade-list"><div class="empty">No trades yet — run: python bot_v2.py</div></div>
   </div>
   <div class="panel">
     <div class="card-head"><span class="card-title">Kelly + EV Log</span><span class="card-badge">ENTRIES ONLY</span></div>
@@ -141,8 +143,8 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
 </div>
 
 <div class="footer">
-  <div class="footer-text">Weather Bot v2 · Reads from simulation.json · Refreshes every 10s</div>
-  <div class="sim-badge">⚡ $1,000 SIMULATION</div>
+  <div class="footer-text" id="footer-note">Weather Bot v2 · simulation.json (aggregate of data/state.json + data/markets/) · Refreshes every 10s</div>
+  <div class="sim-badge" id="sim-badge">⚡ SIMULATION</div>
 </div>
 </div>
 
@@ -151,6 +153,8 @@ const fmt2=v=>(v>=0?'+':'')+v.toFixed(2);
 const fmtUSD=v=>'$'+Math.abs(v).toFixed(2);
 const now=()=>new Date().toLocaleTimeString('en-US',{hour12:false});
 const rand=(a,b)=>Math.random()*(b-a)+a;
+const kellyPct=x=>((x.kelly_pct!=null?x.kelly_pct:x.kelly)||0)*100;
+const truncQ=(q,max)=>{const s=q||'';return s.length>max?s.slice(0,max)+'…':s;};
 
 let prevBal=null, chart=null, balHistory=[], timeLabels=[];
 
@@ -178,16 +182,16 @@ function renderPositions(positions){
   if(!Object.keys(positions).length){el.innerHTML='<div class="empty">No open positions</div>';return;}
   el.innerHTML=Object.entries(positions).map(([id,p])=>{
     const pnl=p.pnl||0;
-    const pct=(p.current_price||p.entry_price)*100;
+    const pct=(p.current_price!=null?p.current_price:p.entry_price||0)*100;
     return`<div class="pos-item">
       <div class="pos-top">
-        <div class="pos-q">${(p.question||'').substr(0,58)}...</div>
+        <div class="pos-q">${truncQ(p.question,58)}</div>
         <div class="pos-pnl ${pnl>=0?'pos':'neg'}">${pnl>=0?'+':'-'}$${Math.abs(pnl).toFixed(2)}</div>
       </div>
       <div class="pos-bar"><div class="pos-fill" style="width:${Math.min(100,pct)}%"></div></div>
       <div class="pos-meta">
         <div>${p.location||''}</div>
-        <div>Kelly: <span>${((p.kelly_pct||0)*100).toFixed(1)}%</span></div>
+        <div>Kelly: <span>${kellyPct(p).toFixed(1)}%</span></div>
         <div>EV: <span>${fmt2(p.ev||0)}</span></div>
         <div>$${(p.cost||0).toFixed(2)} in</div>
       </div>
@@ -197,7 +201,7 @@ function renderPositions(positions){
 
 function renderTrades(trades){
   const el=document.getElementById('trade-list');
-  if(!trades||!trades.length){el.innerHTML='<div class="empty">No trades yet — run: python weather_bot_v2.py --live</div>';return;}
+  if(!trades||!trades.length){el.innerHTML='<div class="empty">No trades yet — run: python bot_v2.py (or python bot_v2.py status to refresh simulation.json)</div>';return;}
   const recent=[...trades].reverse().slice(0,15);
   el.innerHTML=recent.map(t=>{
     const isEntry=t.type==='entry';
@@ -207,12 +211,13 @@ function renderTrades(trades){
     const amtStr=isEntry?`-$${(t.cost||0).toFixed(2)}`:(t.pnl||0)>=0?`+$${(t.pnl||0).toFixed(2)}`:`-$${Math.abs(t.pnl||0).toFixed(2)}`;
     const amtCls=isEntry?'neg':(t.pnl||0)>=0?'pos':'neg';
     const time=(t.opened_at||t.closed_at||'').substr(11,5)||'—';
+    const meta=isEntry?`Kelly ${kellyPct(t).toFixed(1)}% · EV ${fmt2(t.ev||0)}`:(t.close_reason||'exit');
     return`<div class="trade-item">
       <div class="t-time">${time}</div>
       <span class="t-badge ${cls}">${label}</span>
       <div class="t-info">
-        <div class="t-q">${(t.question||'').substr(0,45)}...</div>
-        <div class="t-meta">Kelly ${((t.kelly_pct||0)*100).toFixed(1)}% · EV ${fmt2(t.ev||0)}</div>
+        <div class="t-q">${truncQ(t.question,45)}</div>
+        <div class="t-meta">${meta}</div>
       </div>
       <div class="t-right"><div class="t-amount ${amtCls}">${amtStr}</div></div>
     </div>`;
@@ -229,7 +234,7 @@ function renderEvLog(trades){
     return`<div style="padding:7px 14px;border-bottom:1px solid #0a2a0a;font-size:9px;">
       <div style="color:#2a5a2a">${time} · ${t.location||''} · ${t.date||''}</div>
       <div style="color:#88ff88;margin-top:2px">Entry: $${(t.entry_price||0).toFixed(3)} · Our prob: ${((t.our_prob||0)*100).toFixed(0)}%</div>
-      <div style="margin-top:2px">EV: <span style="color:${evCol}">${fmt2(t.ev||0)}</span> per $1 &nbsp;|&nbsp; Kelly: <span style="color:#ffcc00">${((t.kelly_pct||0)*100).toFixed(1)}%</span> &nbsp;|&nbsp; Size: <span style="color:#00ff41">$${(t.cost||0).toFixed(2)}</span></div>
+      <div style="margin-top:2px">EV: <span style="color:${evCol}">${fmt2(t.ev||0)}</span> per $1 &nbsp;|&nbsp; Kelly: <span style="color:#ffcc00">${kellyPct(t).toFixed(1)}%</span> &nbsp;|&nbsp; Size: <span style="color:#00ff41">$${(t.cost||0).toFixed(2)}</span></div>
     </div>`;
   }).join('');
 }
@@ -257,13 +262,19 @@ async function loadData(){
     const pnl = total - start;
     const pct=pnl/start*100;
 
+    const scanEl=document.getElementById('scan-line');
+    const ls=sim.last_scan;
+    if(ls&&ls.ts){scanEl.style.display='block';const d=new Date(ls.ts);const dg=ls.diagnostics||{};scanEl.textContent=`Last scan ${d.toLocaleString()} · new ${ls.new??0} · closed ${ls.closed??0} · resolved ${ls.resolved??0} · eligible ${dg.eligible_markets??'—'} · skipped EV ${dg.skipped_ev??0}`;}
+    else{scanEl.style.display='none';scanEl.textContent='';}
+
     // Stats
     document.getElementById('ts').textContent='Updated: '+now();
     document.getElementById('s-bal').textContent='$'+total.toFixed(2);
     const pnlEl=document.getElementById('s-pnl');
     pnlEl.textContent=(pnl>=0?'+':'')+' $'+Math.abs(pnl).toFixed(2);
     pnlEl.className='stat-val'+(pnl<0?' red':'');
-    document.getElementById('s-pct').textContent=(pct>=0?'+':'')+pct.toFixed(1)+'% return';
+    document.getElementById('s-pct').textContent='vs $'+start.toLocaleString('en-US',{maximumFractionDigits:0})+' start · '+(pct>=0?'+':'')+pct.toFixed(1)+'%';
+    document.getElementById('sim-badge').textContent='⚡ $'+start.toLocaleString('en-US',{maximumFractionDigits:0})+' SIM';
     document.getElementById('s-open').textContent=Object.keys(positions).length;
     const wr=wins+losses>0?(wins/(wins+losses)*100).toFixed(0)+'%':'—';
     document.getElementById('s-wr').textContent=wr;

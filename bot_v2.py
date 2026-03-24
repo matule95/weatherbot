@@ -10,6 +10,7 @@ Usage:
     python bot_v2.py          # main loop
     python bot_v2.py report   # full report
     python bot_v2.py status   # balance and open positions
+    python bot_v2.py health   # GOOD/WARNING/BAD + reasons
 """
 
 import re
@@ -47,6 +48,7 @@ SIGMA_C = 1.2
 DATA_DIR         = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 STATE_FILE       = DATA_DIR / "state.json"
+SIM_EXPORT_FILE  = Path("simulation.json")  # aggregate for sim_dashboard_repost.html
 MARKETS_DIR      = DATA_DIR / "markets"
 MARKETS_DIR.mkdir(exist_ok=True)
 CALIBRATION_FILE = DATA_DIR / "calibration.json"
@@ -98,13 +100,21 @@ def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 def bucket_prob(forecast, t_low, t_high, sigma=None):
-    """For regular buckets — exact match. For edge buckets — normal distribution."""
+    """Probability that realized temp lands inside a bucket."""
     s = sigma or 2.0
+    mu = float(forecast)
+    if s <= 0:
+        return 1.0 if in_bucket(mu, t_low, t_high) else 0.0
     if t_low == -999:
-        return norm_cdf((t_high - float(forecast)) / s)
+        return norm_cdf((t_high - mu) / s)
     if t_high == 999:
-        return 1.0 - norm_cdf((t_low - float(forecast)) / s)
-    return 1.0 if in_bucket(forecast, t_low, t_high) else 0.0
+        return 1.0 - norm_cdf((t_low - mu) / s)
+    if t_low == t_high:
+        lo, hi = t_low - 0.5, t_high + 0.5
+    else:
+        lo, hi = t_low, t_high
+    p = norm_cdf((hi - mu) / s) - norm_cdf((lo - mu) / s)
+    return max(0.0, min(1.0, p))
 
 def calc_ev(p, price):
     if price <= 0 or price >= 1: return 0.0
@@ -139,7 +149,7 @@ def get_sigma(city_slug, source="ecmwf"):
 
 def run_calibration(markets):
     """Recalculates sigma from resolved markets."""
-    resolved = [m for m in markets if m.get("resolved") and m.get("actual_temp") is not None]
+    resolved = [m for m in markets if m.get("status") == "resolved" and m.get("actual_temp") is not None]
     cal = load_cal()
     updated = []
 
@@ -149,9 +159,9 @@ def run_calibration(markets):
             errors = []
             for m in group:
                 snap = next((s for s in reversed(m.get("forecast_snapshots", []))
-                             if s["source"] == source), None)
-                if snap and snap.get("temp") is not None:
-                    errors.append(abs(snap["temp"] - m["actual_temp"]))
+                             if s.get("best_source") == source), None)
+                if snap and snap.get("best") is not None:
+                    errors.append(abs(snap["best"] - m["actual_temp"]))
             if len(errors) < CALIBRATION_MIN:
                 continue
             mae  = sum(errors) / len(errors)
@@ -301,6 +311,41 @@ def get_market_price(market_id):
     except Exception:
         return None
 
+def _to_float(v):
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+def extract_yes_quotes(market):
+    """
+    Returns YES-side executable quote tuple: (bid, ask, mid, spread, is_valid).
+    Prefers explicit bestBid/bestAsk from Gamma.
+    """
+    best_bid = _to_float(market.get("bestBid"))
+    best_ask = _to_float(market.get("bestAsk"))
+    yes_mid = None
+    try:
+        prices = json.loads(market.get("outcomePrices", "[0.5,0.5]"))
+        if prices and len(prices) > 0:
+            yes_mid = _to_float(prices[0])
+    except Exception:
+        pass
+
+    # Prefer real executable orderbook quotes when sane.
+    if best_bid is not None and best_ask is not None:
+        if 0.0 <= best_bid <= 1.0 and 0.0 <= best_ask <= 1.0 and best_ask >= best_bid:
+            mid = yes_mid if yes_mid is not None else (best_bid + best_ask) / 2.0
+            return best_bid, best_ask, mid, (best_ask - best_bid), True
+
+    # Fallback to midpoint-only quote (non-executable). Mark invalid to skip trading.
+    if yes_mid is not None and 0.0 <= yes_mid <= 1.0:
+        return yes_mid, yes_mid, yes_mid, 0.0, False
+
+    return None, None, None, None, False
+
 def parse_temp_range(question):
     if not question: return None
     num = r'(-?\d+(?:\.\d+)?)'
@@ -397,6 +442,88 @@ def load_state():
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
+def write_simulation_export():
+    """Merge state.json + data/markets/*.json into one file for the HTML dashboard."""
+    state = load_state()
+    markets = load_all_markets()
+    positions = {}
+    trades = []
+
+    for m in markets:
+        pos = m.get("position")
+        if not pos:
+            continue
+        key = f"{m['city']}_{m['date']}"
+        city_name = m.get("city_name", m["city"])
+        q = pos.get("question", "")
+        kelly = pos.get("kelly", 0)
+
+        if pos.get("status") == "open":
+            current_price = pos["entry_price"]
+            for o in m.get("all_outcomes", []):
+                if o.get("market_id") == pos.get("market_id"):
+                    current_price = o.get("price", current_price)
+                    break
+            unrealized = round((current_price - pos["entry_price"]) * pos["shares"], 2)
+            positions[key] = {
+                "question": q,
+                "location": city_name,
+                "kelly_pct": kelly,
+                "ev": pos.get("ev", 0),
+                "cost": pos.get("cost", 0),
+                "current_price": current_price,
+                "entry_price": pos.get("entry_price"),
+                "pnl": unrealized,
+            }
+            trades.append({
+                "type": "entry",
+                "question": q,
+                "location": city_name,
+                "date": m.get("date"),
+                "opened_at": pos.get("opened_at") or "",
+                "kelly_pct": kelly,
+                "ev": pos.get("ev", 0),
+                "cost": pos.get("cost", 0),
+                "entry_price": pos.get("entry_price"),
+                "our_prob": pos.get("p", 0),
+            })
+        else:
+            trades.append({
+                "type": "entry",
+                "question": q,
+                "location": city_name,
+                "date": m.get("date"),
+                "opened_at": pos.get("opened_at") or "",
+                "kelly_pct": kelly,
+                "ev": pos.get("ev", 0),
+                "cost": pos.get("cost", 0),
+                "entry_price": pos.get("entry_price"),
+                "our_prob": pos.get("p", 0),
+            })
+            trades.append({
+                "type": "exit",
+                "question": q,
+                "location": city_name,
+                "closed_at": pos.get("closed_at") or "",
+                "pnl": pos.get("pnl", 0),
+                "close_reason": pos.get("close_reason"),
+            })
+
+    trades.sort(key=lambda t: (t.get("opened_at") or t.get("closed_at") or ""))
+
+    out = {
+        "balance": state["balance"],
+        "starting_balance": state["starting_balance"],
+        "total_trades": state["total_trades"],
+        "wins": state["wins"],
+        "losses": state["losses"],
+        "peak_balance": state.get("peak_balance", state["balance"]),
+        "positions": positions,
+        "trades": trades,
+        "last_scan": state.get("last_scan"),
+    }
+    SIM_EXPORT_FILE.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+
 # =============================================================================
 # CORE LOGIC
 # =============================================================================
@@ -439,6 +566,14 @@ def scan_and_update():
     new_pos  = 0
     closed   = 0
     resolved = 0
+    diagnostics = {
+        "eligible_markets": 0,
+        "skipped_no_book": 0,
+        "skipped_bad_quote": 0,
+        "skipped_spread": 0,
+        "skipped_price_or_volume": 0,
+        "skipped_ev": 0,
+    }
 
     for city_slug, loc in LOCATIONS.items():
         unit = loc["unit"]
@@ -474,7 +609,7 @@ def scan_and_update():
             if mkt["status"] == "resolved":
                 continue
 
-            # Update outcomes list — prices taken directly from event
+            # Update outcomes list — use explicit YES bestBid/bestAsk quotes.
             outcomes = []
             for market in event.get("markets", []):
                 question = market.get("question", "")
@@ -483,11 +618,8 @@ def scan_and_update():
                 rng      = parse_temp_range(question)
                 if not rng:
                     continue
-                try:
-                    prices = json.loads(market.get("outcomePrices", "[0.5,0.5]"))
-                    bid = float(prices[0])
-                    ask = float(prices[1]) if len(prices) > 1 else bid
-                except Exception:
+                bid, ask, mid_price, spread, has_book = extract_yes_quotes(market)
+                if bid is None or ask is None or mid_price is None:
                     continue
                 outcomes.append({
                     "question":  question,
@@ -495,8 +627,9 @@ def scan_and_update():
                     "range":     rng,
                     "bid":       round(bid, 4),
                     "ask":       round(ask, 4),
-                    "price":     round(bid, 4),   # for compatibility
-                    "spread":    round(ask - bid, 4),
+                    "price":     round(mid_price, 4),   # midpoint/mark
+                    "spread":    round(spread, 4),
+                    "has_book":  has_book,
                     "volume":    round(volume, 0),
                 })
 
@@ -539,7 +672,10 @@ def scan_and_update():
                         break
 
                 if current_price is not None:
-                    current_price = o.get("bid", current_price)  # sell at bid
+                    current_price = next(
+                        (x.get("bid", current_price) for x in outcomes if x["market_id"] == pos["market_id"]),
+                        current_price
+                    )  # sell at bid
                     entry = pos["entry_price"]
                     stop  = pos.get("stop_price", entry * 0.80)  # 20% stop by default
 
@@ -578,6 +714,10 @@ def scan_and_update():
                             current_price = o["price"]
                             break
                     if current_price is not None:
+                        current_price = next(
+                            (x.get("bid", current_price) for x in outcomes if x["market_id"] == pos["market_id"]),
+                            current_price
+                        )  # sell at bid
                         pnl = round((current_price - pos["entry_price"]) * pos["shares"], 2)
                         balance += pos["cost"] + pnl
                         mkt["position"]["closed_at"]    = snap.get("ts")
@@ -597,6 +737,7 @@ def scan_and_update():
                     t_low, t_high = o["range"]
                     price = o["price"]
                     volume = o["volume"]
+                    diagnostics["eligible_markets"] += 1
 
                     if not in_bucket(forecast_temp, t_low, t_high):
                         continue
@@ -604,16 +745,28 @@ def scan_and_update():
                     bid    = o.get("bid", o["price"])
                     ask    = o.get("ask", o["price"])
                     spread = o.get("spread", 0)
+                    has_book = o.get("has_book", False)
+
+                    # Require executable orderbook quotes for realistic fills.
+                    if not has_book:
+                        diagnostics["skipped_no_book"] += 1
+                        continue
+                    if ask < bid or ask <= 0 or ask >= 1 or bid < 0 or bid > 1:
+                        diagnostics["skipped_bad_quote"] += 1
+                        continue
 
                     # Slippage filter
                     if spread > MAX_SLIPPAGE:
+                        diagnostics["skipped_spread"] += 1
                         continue
                     if ask >= MAX_PRICE or volume < MIN_VOLUME:
+                        diagnostics["skipped_price_or_volume"] += 1
                         continue
 
                     p  = bucket_prob(forecast_temp, t_low, t_high, sigma)
                     ev = calc_ev(p, ask)   # EV calculated from ask
                     if ev < MIN_EV:
+                        diagnostics["skipped_ev"] += 1
                         continue
 
                     kelly = calc_kelly(p, ask)
@@ -688,6 +841,10 @@ def scan_and_update():
         size   = pos["cost"]
         shares = pos["shares"]
         pnl    = round(shares * (1 - price), 2) if won else round(-size, 2)
+        if mkt.get("actual_temp") is None:
+            actual_temp = get_actual_temp(mkt["city"], mkt["date"])
+            if actual_temp is not None:
+                mkt["actual_temp"] = actual_temp
 
         balance += size + pnl
         pos["exit_price"]   = 1.0 if won else 0.0
@@ -713,7 +870,15 @@ def scan_and_update():
 
     state["balance"]      = round(balance, 2)
     state["peak_balance"] = max(state.get("peak_balance", balance), balance)
+    state["last_scan"]    = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "new": new_pos,
+        "closed": closed,
+        "resolved": resolved,
+        "diagnostics": diagnostics,
+    }
     save_state(state)
+    write_simulation_export()
 
     # Run calibration if enough data collected
     all_mkts = load_all_markets()
@@ -722,7 +887,7 @@ def scan_and_update():
         global _cal
         _cal = run_calibration(all_mkts)
 
-    return new_pos, closed, resolved
+    return new_pos, closed, resolved, diagnostics
 
 # =============================================================================
 # REPORT
@@ -740,6 +905,7 @@ def print_status():
     wins    = state["wins"]
     losses  = state["losses"]
     total   = wins + losses
+    last_scan = state.get("last_scan", {})
 
     print(f"\n{'='*55}")
     print(f"  WEATHERBET — STATUS")
@@ -748,6 +914,11 @@ def print_status():
     print(f"  Trades:      {total} | W: {wins} | L: {losses} | WR: {wins/total:.0%}" if total else "  No trades yet")
     print(f"  Open:        {len(open_pos)}")
     print(f"  Resolved:    {len(resolved)}")
+    if last_scan:
+        d = last_scan.get("diagnostics", {})
+        print(f"  Last scan:   {last_scan.get('ts', '-')}")
+        print(f"  Quality:     no_book={d.get('skipped_no_book', 0)} | "
+              f"bad_quote={d.get('skipped_bad_quote', 0)} | spread={d.get('skipped_spread', 0)}")
 
     if open_pos:
         print(f"\n  Open positions:")
@@ -778,6 +949,7 @@ def print_status():
         sign = "+" if total_unrealized >= 0 else ""
         print(f"\n  Unrealized PnL: {sign}{total_unrealized:.2f}")
 
+    write_simulation_export()
     print(f"{'='*55}\n")
 
 def print_report():
@@ -824,6 +996,269 @@ def print_report():
         print(f"    {m['city_name']:<16} {m['date']} | {label:<14} | {fc_str} | {actual} | {result} {pnl_str}")
 
     print(f"{'='*55}\n")
+
+def print_explain():
+    print(f"\n{'='*55}")
+    print(f"  WEATHERBET — EXPLAIN")
+    print(f"{'='*55}")
+    print("  What this bot does:")
+    print("  1) Reads weather forecasts for each city/date.")
+    print("  2) Reads Polymarket quotes (best bid/ask).")
+    print("  3) Buys only when expected value and risk filters pass.")
+    print("  4) Closes on stop-loss, forecast shift, or market resolution.")
+    print("")
+    print("  What to check first:")
+    print("  - Run: python bot_v2.py status")
+    print("  - Quality line should not show huge bad_quote counts.")
+    print("  - Open positions should use realistic entry prices (ask side).")
+    print("")
+    print("  If older data was created before quote-fix update:")
+    print("  - Backup then clear the data folder for a clean run.")
+    print("  - PowerShell: Remove-Item -Recurse -Force .\\data")
+    print("  - Then run bot again and let it collect fresh snapshots.")
+    print("")
+    print("  How to judge outcomes (simple):")
+    print("  - First 1-2 weeks: focus on data quality and stability, not PnL.")
+    print("  - After 50+ resolved trades: check win rate + average PnL per trade.")
+    print("  - After calibration grows: watch if sigma values stabilize.")
+    print("")
+    print("  One-line system check:")
+    print("  - Run: python bot_v2.py health")
+    print(f"{'='*55}\n")
+
+
+def probe_external_apis():
+    """
+    Quick live checks (short timeouts). Used by `health` only — not part of trading loop.
+    """
+    out = {}
+
+    try:
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            "?latitude=40.78&longitude=-73.87&daily=temperature_2m_max&forecast_days=1"
+        )
+        r = requests.get(url, timeout=(3, 6))
+        ok = r.ok and "daily" in r.json()
+        out["open_meteo"] = {"ok": ok, "http": r.status_code}
+    except Exception as e:
+        out["open_meteo"] = {"ok": False, "http": None, "error": str(e)[:100]}
+
+    try:
+        r = requests.get(
+            "https://gamma-api.polymarket.com/events?slug=highest-temperature-in-chicago-on-march-22-2026",
+            timeout=(3, 6),
+        )
+        data = r.json() if r.ok else []
+        ok = r.ok and isinstance(data, list) and len(data) > 0
+        out["gamma"] = {"ok": ok, "http": r.status_code}
+    except Exception as e:
+        out["gamma"] = {"ok": False, "http": None, "error": str(e)[:100]}
+
+    try:
+        r = requests.get(
+            "https://aviationweather.gov/api/data/metar?ids=KORD&format=json",
+            timeout=(3, 6),
+        )
+        data = r.json()
+        out["metar"] = {"ok": r.ok and isinstance(data, list), "http": r.status_code}
+    except Exception as e:
+        out["metar"] = {"ok": False, "http": None, "error": str(e)[:100]}
+
+    k = (VC_KEY or "").strip()
+    if not k or "YOUR" in k.upper():
+        out["visual_crossing"] = {"ok": None, "note": "no key (resolution temps optional until set)"}
+    else:
+        try:
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            url = (
+                f"https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
+                f"/KORD/{day}/{day}?unitGroup=us&key={k}&include=days&elements=tempmax"
+            )
+            r = requests.get(url, timeout=(3, 6))
+            jd = r.json() if r.ok else {}
+            ok = r.ok and bool(jd.get("days"))
+            out["visual_crossing"] = {"ok": ok, "http": r.status_code}
+            if not ok and r.ok:
+                out["visual_crossing"]["error"] = str(jd.get("message", "no days"))[:80]
+        except Exception as e:
+            out["visual_crossing"] = {"ok": False, "http": None, "error": str(e)[:100]}
+
+    return out
+
+
+def print_health():
+    """Single-screen GOOD / WARNING / BAD with reasons."""
+    state = load_state()
+    markets = load_all_markets()
+    cal = load_cal()
+    last_scan = state.get("last_scan") or {}
+    d = last_scan.get("diagnostics", {}) if isinstance(last_scan, dict) else {}
+
+    open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
+    resolved = [m for m in markets if m["status"] == "resolved"]
+    with_actual = [m for m in resolved if m.get("actual_temp") is not None]
+
+    bad, warn, notes, good = [], [], [], []
+
+    apis = probe_external_apis()
+    if not apis.get("open_meteo", {}).get("ok"):
+        bad.append(
+            "Open-Meteo unreachable or bad response — forecasts will fail. "
+            + (apis["open_meteo"].get("error") or f"HTTP {apis['open_meteo'].get('http')}")
+        )
+    else:
+        good.append("Open-Meteo OK")
+
+    if not apis.get("gamma", {}).get("ok"):
+        bad.append(
+            "Polymarket Gamma unreachable or empty — cannot load markets. "
+            + (apis["gamma"].get("error") or f"HTTP {apis['gamma'].get('http')}")
+        )
+    else:
+        good.append("Polymarket API OK")
+
+    met = apis.get("metar", {})
+    if met.get("ok"):
+        good.append("METAR OK")
+    else:
+        warn.append(
+            "METAR check failed — D+0 observation extras may be missing. "
+            + (met.get("error") or f"HTTP {met.get('http')}")
+        )
+
+    vc = apis.get("visual_crossing", {})
+    if vc.get("ok") is None:
+        warn.append(
+            "Visual Crossing key missing or placeholder — set vc_key in config.json for actual_temp after resolution."
+        )
+    elif vc.get("ok") is False:
+        warn.append(
+            "Visual Crossing key present but request failed — check quota/key. "
+            + (vc.get("error") or f"HTTP {vc.get('http')}")
+        )
+    else:
+        good.append("Visual Crossing OK")
+
+    eligible = max(0, int(d.get("eligible_markets", 0)))
+    no_book = int(d.get("skipped_no_book", 0))
+    bad_quote = int(d.get("skipped_bad_quote", 0))
+    if eligible > 30:
+        badish = (no_book + bad_quote) / eligible
+        if badish > 0.55:
+            bad.append(
+                f"Last scan quote quality very poor: {(badish*100):.0f}% of buckets had no book or bad quotes "
+                f"({no_book}+{bad_quote} / {eligible}). Expect few or no trades."
+            )
+        elif badish > 0.30:
+            warn.append(
+                f"Last scan: many buckets skipped for quotes ({(badish*100):.0f}% no_book+bad_quote / eligible)."
+            )
+
+    ts = last_scan.get("ts")
+    if ts:
+        try:
+            t_end = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if t_end.tzinfo is None:
+                t_end = t_end.replace(tzinfo=timezone.utc)
+            age_sec = (datetime.now(timezone.utc) - t_end).total_seconds()
+            stale = SCAN_INTERVAL * 2 + 900
+            if age_sec > stale:
+                warn.append(
+                    f"No recent full scan (last {int(age_sec/3600)}h ago). "
+                    "If the bot should be running, check the terminal for errors or restart it."
+                )
+            else:
+                good.append(f"Last full scan {int(age_sec/60)} min ago")
+        except Exception:
+            warn.append("Could not parse last_scan timestamp in state.json.")
+    else:
+        notes.append("No last_scan yet — run one full scan: python bot_v2.py")
+
+    if len(resolved) < CALIBRATION_MIN:
+        notes.append(
+            f"Calibration still learning: {len(resolved)} resolved / {CALIBRATION_MIN}+ recommended for stable sigma."
+        )
+    else:
+        good.append(f"Enough resolved markets for calibration runs ({len(resolved)}).")
+
+    n_cal = len(cal) if isinstance(cal, dict) else 0
+    if n_cal > 0:
+        good.append(f"calibration.json has {n_cal} city/source sigmas.")
+    elif len(resolved) >= CALIBRATION_MIN:
+        warn.append("Many resolved markets but calibration.json empty — next full scan should populate it.")
+
+    legacy_open = 0
+    for m in open_pos:
+        pos = m["position"]
+        for o in m.get("all_outcomes", []):
+            if str(o.get("market_id")) == str(pos.get("market_id")):
+                if not o.get("has_book", False):
+                    legacy_open += 1
+                break
+    if legacy_open:
+        warn.append(
+            f"{legacy_open} open position(s) tied to snapshots without has_book (old data). "
+            "For clean metrics: close bot, backup data, delete data folder, restart."
+        )
+
+    level = "GOOD"
+    if bad:
+        level = "BAD"
+    elif warn:
+        level = "WARNING"
+
+    print(f"\n{'='*55}")
+    print(f"  WEATHERBET — HEALTH: {level}")
+    print(f"{'='*55}")
+    print(f"  Balance: ${state.get('balance', 0):,.2f} | Open: {len(open_pos)} | Resolved: {len(resolved)} "
+          f"| With actual_temp: {len(with_actual)}")
+
+    if last_scan and ts:
+        print(f"  Last scan: {ts}")
+        print(
+            f"  Scan filters: eligible={eligible} | no_book={no_book} | bad_quote={bad_quote} | "
+            f"spread={d.get('skipped_spread', 0)} | ev_below={d.get('skipped_ev', 0)}"
+        )
+
+    print(f"\n  APIs (live probe):")
+    for name, info in apis.items():
+        if info.get("ok") is True:
+            print(f"    {name}: OK (HTTP {info.get('http', '-')})")
+        elif info.get("ok") is None:
+            print(f"    {name}: skipped — {info.get('note', '')}")
+        else:
+            err = info.get("error") or info.get("note") or f"HTTP {info.get('http')}"
+            print(f"    {name}: FAIL — {err}")
+
+    if bad:
+        print(f"\n  Blockers:")
+        for line in bad:
+            print(f"    - {line}")
+    if warn:
+        print(f"\n  Warnings:")
+        for line in warn:
+            print(f"    - {line}")
+    if notes:
+        print(f"\n  Notes:")
+        for line in notes:
+            print(f"    - {line}")
+    if good:
+        print(f"\n  OK:")
+        for line in good[:10]:
+            print(f"    - {line}")
+
+    print(f"\n  What this means:")
+    if level == "BAD":
+        print("    Fix blockers first; the bot cannot run correctly until APIs and quotes behave.")
+    elif level == "WARNING":
+        print("    Safe to experiment, but read warnings — results may be incomplete or noisy.")
+    else:
+        print("    Core checks passed; still monitor PnL only after many resolved trades.")
+    print(f"{'='*55}\n")
+
+    write_simulation_export()
+
 
 # =============================================================================
 # MAIN LOOP
@@ -885,6 +1320,7 @@ def monitor_positions():
         state["balance"] = round(balance, 2)
         save_state(state)
 
+    write_simulation_export()
     return closed
 
 
@@ -912,14 +1348,17 @@ def run_loop():
         if now_ts - last_full_scan >= SCAN_INTERVAL:
             print(f"[{now_str}] full scan...")
             try:
-                new_pos, closed, resolved = scan_and_update()
+                new_pos, closed, resolved, diag = scan_and_update()
                 state = load_state()
                 print(f"  balance: ${state['balance']:,.2f} | "
                       f"new: {new_pos} | closed: {closed} | resolved: {resolved}")
+                print(f"  quotes: no_book={diag['skipped_no_book']} | "
+                      f"bad_quote={diag['skipped_bad_quote']} | spread={diag['skipped_spread']}")
                 last_full_scan = time.time()
             except KeyboardInterrupt:
                 print(f"\n  Stopping — saving state...")
                 save_state(load_state())
+                write_simulation_export()
                 print(f"  Done. Bye!")
                 break
             except requests.exceptions.ConnectionError:
@@ -946,6 +1385,7 @@ def run_loop():
         except KeyboardInterrupt:
             print(f"\n  Stopping — saving state...")
             save_state(load_state())
+            write_simulation_export()
             print(f"  Done. Bye!")
             break
 
@@ -963,5 +1403,11 @@ if __name__ == "__main__":
     elif cmd == "report":
         _cal = load_cal()
         print_report()
+    elif cmd == "explain":
+        _cal = load_cal()
+        print_explain()
+    elif cmd == "health":
+        _cal = load_cal()
+        print_health()
     else:
-        print("Usage: python bot_v2.py [run|status|report]")
+        print("Usage: python bot_v2.py [run|status|report|explain|health]")
