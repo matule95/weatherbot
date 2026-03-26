@@ -1,6 +1,6 @@
 {
-  "balance": 10000.0,
-  "max_bet": 20.0,
+  "balance": 100.0,
+  "max_bet": 5.0,
   "min_ev": 0.1,
   "max_price": 0.45,
   "min_volume": 500,
@@ -9,6 +9,6 @@
   "kelly_fraction": 0.25,
   "scan_interval": 3600,
   "calibration_min": 30,
-  "vc_key": "WRMA8UUMVWY2K89KSZQJJLHT8",
+  "vc_key": "E4XPLTB4WSL24ULQFZ74R7SCV",
   "max_slippage": 0.03
 }

@@ -10,18 +10,33 @@ Usage:
     python bot_v1.py --positions  # Show open positions
 """
 
+import os
 import re
 import json
 import argparse
 import requests
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 
-with open("config.json") as f:
-    _cfg = json.load(f)
+def _load_config():
+    p = Path(os.environ.get("WEATHERBOT_CONFIG", "config.json"))
+    if not p.is_file():
+        ex = Path("config.example.json")
+        if ex.is_file():
+            p = ex
+        else:
+            raise FileNotFoundError(
+                "Missing config.json — copy config.example.json to config.json "
+                "(or set WEATHERBOT_CONFIG)."
+            )
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+_cfg = _load_config()
 
 ENTRY_THRESHOLD = _cfg.get("entry_threshold", 0.15)   # Buy below this price
 EXIT_THRESHOLD  = _cfg.get("exit_threshold", 0.45)    # Sell above this price

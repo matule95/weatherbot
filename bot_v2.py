@@ -3,8 +3,9 @@
 """
 bot_v2.py — Weather Trading Bot for Polymarket
 =====================================================
-Tracks weather forecasts from 3 sources (ECMWF, HRRR, METAR),
-compares with Polymarket markets, paper trades using Kelly criterion.
+Tracks weather forecasts from 3 sources (ECMWF, US short-range blend via
+Open-Meteo gfs_seamless, METAR), compares with Polymarket markets, and
+paper-trades using Kelly criterion (no on-chain order execution).
 
 Usage:
     python bot_v2.py          # main loop
@@ -13,6 +14,7 @@ Usage:
     python bot_v2.py health   # GOOD/WARNING/BAD + reasons
 """
 
+import os
 import re
 import sys
 import json
@@ -26,8 +28,21 @@ from pathlib import Path
 # CONFIG
 # =============================================================================
 
-with open("config.json", encoding="utf-8") as f:
-    _cfg = json.load(f)
+def _load_config():
+    p = Path(os.environ.get("WEATHERBOT_CONFIG", "config.json"))
+    if not p.is_file():
+        ex = Path("config.example.json")
+        if ex.is_file():
+            p = ex
+        else:
+            raise FileNotFoundError(
+                "Missing config.json — copy config.example.json to config.json "
+                "(or set WEATHERBOT_CONFIG to a JSON path)."
+            )
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+_cfg = _load_config()
 
 BALANCE          = _cfg.get("balance", 10000.0)
 MAX_BET          = _cfg.get("max_bet", 20.0)        # max bet per trade
@@ -40,7 +55,13 @@ KELLY_FRACTION   = _cfg.get("kelly_fraction", 0.25)
 MAX_SLIPPAGE     = _cfg.get("max_slippage", 0.03)  # max allowed ask-bid spread
 SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)   # every hour
 CALIBRATION_MIN  = _cfg.get("calibration_min", 30)
-VC_KEY           = _cfg.get("vc_key", "")
+VC_KEY = (
+    os.environ.get("VC_KEY")
+    or os.environ.get("WEATHERBOT_VC_KEY")
+    or _cfg.get("vc_key")
+    or ""
+)
+VC_KEY = str(VC_KEY).strip()
 
 SIGMA_F = 2.0
 SIGMA_C = 1.2
@@ -142,24 +163,45 @@ def load_cal():
     return {}
 
 def get_sigma(city_slug, source="ecmwf"):
+    if source == "hrrr":
+        source = "us_short"
     key = f"{city_slug}_{source}"
     if key in _cal:
         return _cal[key]["sigma"]
+    if source == "us_short":
+        leg = _cal.get(f"{city_slug}_hrrr")
+        if leg:
+            return leg["sigma"]
     return SIGMA_F if LOCATIONS[city_slug]["unit"] == "F" else SIGMA_C
 
+def _snapshot_source_matches(snap, source):
+    bs = snap.get("best_source")
+    if source == "us_short":
+        return bs in ("us_short", "hrrr")
+    return bs == source
+
+
 def run_calibration(markets):
-    """Recalculates sigma from resolved markets."""
+    """Recalculates sigma from resolved markets.
+
+    Uses mean absolute error between each snapshot's *best* forecast and
+    actual_temp as the Gaussian spread for bucket_prob. That is a pragmatic
+    heuristic, not a proper MLE for daily-max errors — tails may be misstated.
+    """
     resolved = [m for m in markets if m.get("status") == "resolved" and m.get("actual_temp") is not None]
     cal = load_cal()
     updated = []
 
-    for source in ["ecmwf", "hrrr", "metar"]:
+    for source in ["ecmwf", "us_short", "metar"]:
         for city in set(m["city"] for m in resolved):
             group = [m for m in resolved if m["city"] == city]
             errors = []
             for m in group:
-                snap = next((s for s in reversed(m.get("forecast_snapshots", []))
-                             if s.get("best_source") == source), None)
+                snap = next(
+                    (s for s in reversed(m.get("forecast_snapshots", []))
+                     if _snapshot_source_matches(s, source)),
+                    None,
+                )
                 if snap and snap.get("best") is not None:
                     errors.append(abs(snap["best"] - m["actual_temp"]))
             if len(errors) < CALIBRATION_MIN:
@@ -204,8 +246,8 @@ def get_ecmwf(city_slug, dates):
         print(f"  [ECMWF] {city_slug}: {e}")
     return result
 
-def get_hrrr(city_slug, dates):
-    """HRRR via Open-Meteo. US cities only, up to 48h horizon."""
+def get_us_short_forecast(city_slug, dates):
+    """US-only daily max from Open-Meteo ``gfs_seamless`` (GFS-focused blend, not literal HRRR)."""
     loc = LOCATIONS[city_slug]
     if loc["region"] != "us":
         return {}
@@ -216,7 +258,7 @@ def get_hrrr(city_slug, dates):
             f"?latitude={loc['lat']}&longitude={loc['lon']}"
             f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
             f"&forecast_days=3&timezone={TIMEZONES.get(city_slug, 'UTC')}"
-            f"&models=gfs_seamless"  # HRRR+GFS seamless — best option for US
+            f"&models=gfs_seamless"
         )
         data = requests.get(url, timeout=(5, 8)).json()
         if "error" not in data:
@@ -224,7 +266,7 @@ def get_hrrr(city_slug, dates):
                 if date in dates and temp is not None:
                     result[date] = round(temp)
     except Exception as e:
-        print(f"  [HRRR] {city_slug}: {e}")
+        print(f"  [US_SHORT] {city_slug}: {e}")
     return result
 
 def get_metar(city_slug):
@@ -303,10 +345,26 @@ def get_polymarket_event(city_slug, month, day, year):
         pass
     return None
 
-def get_market_price(market_id):
+def fetch_gamma_market(market_id):
+    """Full Gamma market JSON (bid/ask + outcomePrices)."""
     try:
-        r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(3, 5))
-        prices = json.loads(r.json().get("outcomePrices", "[0.5,0.5]"))
+        r = requests.get(
+            f"https://gamma-api.polymarket.com/markets/{market_id}",
+            timeout=(3, 5),
+        )
+        if not r.ok:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def get_market_price(market_id):
+    doc = fetch_gamma_market(market_id)
+    if not doc:
+        return None
+    try:
+        prices = json.loads(doc.get("outcomePrices", "[0.5,0.5]"))
         return float(prices[0])
     except Exception:
         return None
@@ -531,23 +589,24 @@ def write_simulation_export():
 def take_forecast_snapshot(city_slug, dates):
     """Fetches forecasts from all sources and returns a snapshot."""
     now_str = datetime.now(timezone.utc).isoformat()
-    ecmwf   = get_ecmwf(city_slug, dates)
-    hrrr    = get_hrrr(city_slug, dates)
-    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    ecmwf = get_ecmwf(city_slug, dates)
+    us_short = get_us_short_forecast(city_slug, dates)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    us_horizon = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d")
 
     snapshots = {}
     for date in dates:
+        us_val = us_short.get(date) if date <= us_horizon else None
         snap = {
-            "ts":    now_str,
-            "ecmwf": ecmwf.get(date),
-            "hrrr":  hrrr.get(date) if date <= (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d") else None,
-            "metar": get_metar(city_slug) if date == today else None,
+            "ts":       now_str,
+            "ecmwf":    ecmwf.get(date),
+            "us_short": us_val,
+            "metar":    get_metar(city_slug) if date == today else None,
         }
-        # Best forecast: HRRR for US D+0/D+1, otherwise ECMWF
         loc = LOCATIONS[city_slug]
-        if loc["region"] == "us" and snap["hrrr"] is not None:
-            snap["best"] = snap["hrrr"]
-            snap["best_source"] = "hrrr"
+        if loc["region"] == "us" and snap["us_short"] is not None:
+            snap["best"] = snap["us_short"]
+            snap["best_source"] = "us_short"
         elif snap["ecmwf"] is not None:
             snap["best"] = snap["ecmwf"]
             snap["best_source"] = "ecmwf"
@@ -643,7 +702,7 @@ def scan_and_update():
                 "horizon":     horizon,
                 "hours_left":  round(hours, 1),
                 "ecmwf":       snap.get("ecmwf"),
-                "hrrr":        snap.get("hrrr"),
+                "us_short":    snap.get("us_short"),
                 "metar":       snap.get("metar"),
                 "best":        snap.get("best"),
                 "best_source": snap.get("best_source"),
@@ -1267,7 +1326,7 @@ def print_health():
 MONITOR_INTERVAL = 600  # monitor positions every 10 minutes
 
 def monitor_positions():
-    """Quick stop check on open positions without full scan."""
+    """Stop / trailing check between full scans using fresh Gamma bid/ask per position."""
     markets  = load_all_markets()
     open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
     if not open_pos:
@@ -1277,16 +1336,32 @@ def monitor_positions():
     balance = state["balance"]
     closed  = 0
 
-    for mkt in open_pos:
+    for idx, mkt in enumerate(open_pos):
         pos = mkt["position"]
-        mid = pos["market_id"]
+        mid = str(pos["market_id"])
 
-        # Get current price from all_outcomes (no extra requests)
         current_price = None
-        for o in mkt.get("all_outcomes", []):
-            if o["market_id"] == mid:
-                current_price = o.get("bid", o["price"])  # use bid — sell price
-                break
+        book = fetch_gamma_market(mid)
+        if book:
+            bid, ask, mid_price, spread, has_book = extract_yes_quotes(book)
+            if bid is not None and ask is not None:
+                current_price = bid
+                for o in mkt.get("all_outcomes", []):
+                    if str(o.get("market_id")) == mid:
+                        o["bid"] = round(bid, 4)
+                        o["ask"] = round(ask, 4)
+                        o["price"] = round(mid_price, 4) if mid_price is not None else o["price"]
+                        o["spread"] = round(spread, 4) if spread is not None else o.get("spread", 0)
+                        o["has_book"] = has_book
+                        break
+                pos["last_monitor_quote_ts"] = datetime.now(timezone.utc).isoformat()
+                save_market(mkt)
+
+        if current_price is None:
+            for o in mkt.get("all_outcomes", []):
+                if str(o.get("market_id")) == mid:
+                    current_price = o.get("bid", o.get("price"))
+                    break
 
         if current_price is None:
             continue
@@ -1300,6 +1375,7 @@ def monitor_positions():
             pos["trailing_activated"] = True
             city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
             print(f"  [TRAILING] {city_name} {mkt['date']} — stop moved to breakeven ${entry:.3f}")
+            save_market(mkt)
 
         # Check stop
         if current_price <= stop:
@@ -1315,6 +1391,9 @@ def monitor_positions():
             city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
             print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
             save_market(mkt)
+
+        if idx + 1 < len(open_pos):
+            time.sleep(0.12)
 
     if closed:
         state["balance"] = round(balance, 2)
@@ -1334,7 +1413,7 @@ def run_loop():
     print(f"  Cities:     {len(LOCATIONS)}")
     print(f"  Balance:    ${BALANCE:,.0f} | Max bet: ${MAX_BET}")
     print(f"  Scan:       {SCAN_INTERVAL//60} min | Monitor: {MONITOR_INTERVAL//60} min")
-    print(f"  Sources:    ECMWF + HRRR(US) + METAR(D+0)")
+    print(f"  Sources:    ECMWF + US gfs_seamless + METAR(D+0)")
     print(f"  Data:       {DATA_DIR.resolve()}")
     print(f"  Ctrl+C to stop\n")
 

@@ -1,0 +1,18 @@
+{
+  "balance": 10000.0,
+  "max_bet": 20.0,
+  "min_ev": 0.05,
+  "max_price": 0.45,
+  "min_volume": 2000,
+  "min_hours": 2.0,
+  "max_hours": 72.0,
+  "kelly_fraction": 0.25,
+  "max_slippage": 0.03,
+  "scan_interval": 3600,
+  "calibration_min": 30,
+  "vc_key": "",
+  "entry_threshold": 0.15,
+  "exit_threshold": 0.45,
+  "max_trades_per_run": 5,
+  "min_hours_to_resolution": 2
+}

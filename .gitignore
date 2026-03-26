@@ -201,6 +201,11 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Weatherbot local secrets and generated data
+config.json
+data/
+simulation.json
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
