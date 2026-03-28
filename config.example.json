@@ -1,6 +1,7 @@
 {
   "balance": 10000.0,
   "max_bet": 20.0,
+  "min_bet": 0.50,
   "min_ev": 0.05,
   "max_price": 0.45,
   "min_volume": 2000,
@@ -9,10 +10,12 @@
   "kelly_fraction": 0.25,
   "max_slippage": 0.03,
   "scan_interval": 3600,
+  "monitor_interval": 600,
   "calibration_min": 30,
   "vc_key": "",
-  "entry_threshold": 0.15,
-  "exit_threshold": 0.45,
-  "max_trades_per_run": 5,
-  "min_hours_to_resolution": 2
+  "real_trading": false,
+  "poly_private_key": "",
+  "poly_chain_id": 137,
+  "poly_signature_type": 0,
+  "poly_funder": ""
 }

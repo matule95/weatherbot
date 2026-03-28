@@ -5,7 +5,13 @@ bot_v2.py — Weather Trading Bot for Polymarket
 =====================================================
 Tracks weather forecasts from 3 sources (ECMWF, US short-range blend via
 Open-Meteo gfs_seamless, METAR), compares with Polymarket markets, and
-paper-trades using Kelly criterion (no on-chain order execution).
+trades using Kelly criterion.
+
+Modes:
+  Paper (default): positions tracked locally only, no on-chain orders.
+  Live:            set real_trading=true + poly_private_key in config.json.
+                   Requires: pip install py-clob-client
+                   Uses Polymarket CLOB API on Polygon (chain_id 137).
 
 Usage:
     python bot_v2.py          # main loop
@@ -45,7 +51,8 @@ def _load_config():
 _cfg = _load_config()
 
 BALANCE          = _cfg.get("balance", 10000.0)
-MAX_BET          = _cfg.get("max_bet", 20.0)        # max bet per trade
+MAX_BET          = _cfg.get("max_bet", 20.0)        # max order size
+MIN_BET          = _cfg.get("min_bet", 0.50)        # min order size
 MIN_EV           = _cfg.get("min_ev", 0.10)
 MAX_PRICE        = _cfg.get("max_price", 0.45)
 MIN_VOLUME       = _cfg.get("min_volume", 500)
@@ -53,7 +60,8 @@ MIN_HOURS        = _cfg.get("min_hours", 2.0)
 MAX_HOURS        = _cfg.get("max_hours", 72.0)
 KELLY_FRACTION   = _cfg.get("kelly_fraction", 0.25)
 MAX_SLIPPAGE     = _cfg.get("max_slippage", 0.03)  # max allowed ask-bid spread
-SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)   # every hour
+SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)    # every hour
+MONITOR_INTERVAL = _cfg.get("monitor_interval", 600)  # position check interval
 CALIBRATION_MIN  = _cfg.get("calibration_min", 30)
 VC_KEY = (
     os.environ.get("VC_KEY")
@@ -62,6 +70,28 @@ VC_KEY = (
     or ""
 )
 VC_KEY = str(VC_KEY).strip()
+
+REAL_TRADING   = bool(_cfg.get("real_trading", False))
+POLY_PK        = (
+    os.environ.get("POLY_PRIVATE_KEY")
+    or os.environ.get("WEATHERBOT_POLY_KEY")
+    or _cfg.get("poly_private_key")
+    or ""
+)
+POLY_PK        = str(POLY_PK).strip()
+POLY_CHAIN_ID  = int(_cfg.get("poly_chain_id", 137))
+POLY_SIGNATURE_TYPE = int(
+    os.environ.get("POLY_SIGNATURE_TYPE")
+    or os.environ.get("WEATHERBOT_POLY_SIGNATURE_TYPE")
+    or _cfg.get("poly_signature_type", 0)
+)
+POLY_FUNDER = (
+    os.environ.get("POLY_FUNDER")
+    or os.environ.get("WEATHERBOT_POLY_FUNDER")
+    or _cfg.get("poly_funder")
+    or ""
+)
+POLY_FUNDER = str(POLY_FUNDER).strip()
 
 SIGMA_F = 2.0
 SIGMA_C = 1.2
@@ -377,6 +407,117 @@ def _to_float(v):
     except Exception:
         return None
 
+def _clamp_order_price(price):
+    """Clamp order price to Polymarket's accepted [0.001, 0.999] range."""
+    p = _to_float(price)
+    if p is None:
+        return None
+    return round(min(0.999, max(0.001, p)), 4)
+
+def _live_executable_bid(outcomes, market_id):
+    """
+    Return executable YES bid for LIVE exits only.
+    Requires orderbook-backed quote and valid CLOB price range.
+    """
+    mid = str(market_id)
+    for o in outcomes or []:
+        if str(o.get("market_id")) != mid:
+            continue
+        if not o.get("has_book", False):
+            continue
+        bid = _to_float(o.get("bid"))
+        if bid is None:
+            continue
+        if 0.001 <= bid <= 0.999:
+            return round(bid, 4)
+    return None
+
+def _extract_named_numbers(payload, key_re):
+    """
+    Recursively collect numeric values where the field name matches key_re.
+    Accepts either numeric or numeric-string values.
+    """
+    out = []
+    if isinstance(payload, dict):
+        for k, v in payload.items():
+            if key_re.search(str(k)):
+                num = _to_float(v)
+                if num is not None:
+                    out.append(num)
+            out.extend(_extract_named_numbers(v, key_re))
+    elif isinstance(payload, list):
+        for item in payload:
+            out.extend(_extract_named_numbers(item, key_re))
+    return out
+
+def _raw_to_shares(raw_value, requested_shares):
+    """
+    Convert API balance-style values to shares.
+    CLOB errors indicate 1e6 scaling for conditional token amounts.
+    """
+    v = _to_float(raw_value)
+    if v is None:
+        return None
+    # If number is orders of magnitude larger than requested shares, treat as 1e6-scaled.
+    if requested_shares > 0 and v > requested_shares * 1000:
+        return v / 1_000_000.0
+    return v
+
+def _get_live_sellable_shares(client, token_id, requested_shares, market_id):
+    """
+    Read conditional-token balance/allowance and return safe sellable shares.
+    Returns None if we can't determine the value (caller can fallback to legacy behavior).
+    """
+    try:
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType  # type: ignore
+
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=str(token_id),
+            signature_type=POLY_SIGNATURE_TYPE,
+        )
+        # Refresh server-side view before reading.
+        try:
+            client.update_balance_allowance(params)
+        except Exception:
+            pass
+        info = client.get_balance_allowance(params)
+        if not isinstance(info, (dict, list)):
+            return None
+
+        bal_vals = _extract_named_numbers(info, re.compile(r"balance", re.IGNORECASE))
+        alw_vals = _extract_named_numbers(info, re.compile(r"allowance", re.IGNORECASE))
+
+        if not bal_vals and not alw_vals:
+            return None
+
+        # Use the largest seen balance/allowance fields, then min(balance, allowance).
+        bal_raw = max(bal_vals) if bal_vals else None
+        alw_raw = max(alw_vals) if alw_vals else None
+
+        bal_shares = _raw_to_shares(bal_raw, requested_shares) if bal_raw is not None else None
+        alw_shares = _raw_to_shares(alw_raw, requested_shares) if alw_raw is not None else None
+
+        if bal_shares is not None and alw_shares is not None:
+            spendable = min(bal_shares, alw_shares)
+        else:
+            spendable = bal_shares if bal_shares is not None else alw_shares
+
+        if spendable is None:
+            return None
+
+        safe_size = max(0.0, math.floor(float(spendable) * 100) / 100)
+        req_size = max(0.0, math.floor(float(requested_shares) * 100) / 100)
+        if safe_size < req_size:
+            print(
+                f"  [CLOB SELL PRECHECK] market {market_id}: "
+                f"requested {req_size} shares, spendable {safe_size} shares"
+            )
+        return min(req_size, safe_size)
+    except Exception as e:
+        print(f"  [CLOB SELL PRECHECK WARN] market {market_id}: {e}")
+        return None
+
 def extract_yes_quotes(market):
     """
     Returns YES-side executable quote tuple: (bid, ask, mid, spread, is_valid).
@@ -432,6 +573,169 @@ def in_bucket(forecast, t_low, t_high):
     if t_low == t_high:
         return round(float(forecast)) == round(t_low)
     return t_low <= float(forecast) <= t_high
+
+# =============================================================================
+# POLYMARKET CLOB EXECUTION (real trading)
+# Requires: pip install py-clob-client
+# Set real_trading=true + poly_private_key in config.json to enable.
+# In paper mode (default) these functions are no-ops.
+# =============================================================================
+
+_clob_client = None
+
+
+def _get_clob_client():
+    """Lazy-init the Polymarket CLOB client (only when real_trading=True)."""
+    global _clob_client
+    if _clob_client is not None:
+        return _clob_client
+    if not REAL_TRADING:
+        return None
+    if not POLY_PK:
+        raise RuntimeError(
+            "real_trading=true but poly_private_key is not set. "
+            "Add it to config.json or set POLY_PRIVATE_KEY env var."
+        )
+    if POLY_SIGNATURE_TYPE in (1, 2) and not POLY_FUNDER:
+        raise RuntimeError(
+            "signature_type=1/2 requires a proxy funder address. "
+            "Set poly_funder in config.json (or POLY_FUNDER env var)."
+        )
+    try:
+        from py_clob_client.client import ClobClient  # type: ignore
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            key=POLY_PK,
+            chain_id=POLY_CHAIN_ID,
+            signature_type=POLY_SIGNATURE_TYPE,
+            funder=(POLY_FUNDER or None),
+        )
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+        _clob_client = client
+        print("  [CLOB] Polymarket CLOB client initialized (LIVE TRADING).")
+        return _clob_client
+    except ImportError:
+        raise RuntimeError(
+            "py-clob-client not installed. Run: pip install py-clob-client"
+        )
+    except Exception as e:
+        raise RuntimeError(f"CLOB client init failed: {e}")
+
+
+def get_yes_token_id(market):
+    """Extract the YES-side CLOB token ID from a Gamma market object."""
+    raw = market.get("clobTokenIds")
+    if not raw:
+        return None
+    try:
+        ids = json.loads(raw) if isinstance(raw, str) else raw
+        if ids and len(ids) > 0:
+            return str(ids[0])
+    except Exception:
+        pass
+    return None
+
+
+def execute_buy(token_id, price, cost, market_id):
+    """
+    Place a real YES-token BUY limit order (GTC) on Polymarket CLOB.
+    cost is the dollar amount to spend; shares are ceiling-rounded to ensure
+    shares * price >= cost (prevents Polymarket min-size rejections).
+    Returns order_id string on success, None on failure or in paper mode.
+    """
+    if not REAL_TRADING:
+        return None
+    try:
+        client = _get_clob_client()
+        from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
+        # Ceiling-round shares so dollar_value = shares * price >= cost always.
+        shares = math.ceil(cost / price * 100) / 100
+        order = client.create_order(OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=shares,
+            side="BUY",
+        ))
+        resp = client.post_order(order, OrderType.GTC)
+        order_id = resp.get("orderID") or resp.get("id") or ""
+        print(f"  [CLOB BUY]  market {market_id} | {shares} YES @ ${price:.4f} (${cost:.2f}) | order {order_id}")
+        return order_id
+    except Exception as e:
+        print(f"  [CLOB BUY ERROR] market {market_id}: {e}")
+        return None
+
+
+def execute_sell(token_id, price, shares, market_id):
+    """
+    Place a real YES-token SELL limit order (GTC) on Polymarket CLOB.
+    Returns order_id string on success, None on failure or in paper mode.
+    price should be the current bid (best exit price).
+    """
+    if not REAL_TRADING:
+        return None
+    try:
+        client = _get_clob_client()
+        from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
+        order_price = _clamp_order_price(price)
+        if order_price is None:
+            print(f"  [CLOB SELL SKIP] market {market_id}: invalid price {price}")
+            return None
+        # Keep SELL size conservative to avoid balance/rounding rejections.
+        size = max(0.0, math.floor(float(shares) * 100) / 100)
+        checked_size = _get_live_sellable_shares(client, token_id, size, market_id)
+        if checked_size is not None:
+            size = checked_size
+        if size <= 0:
+            print(f"  [CLOB SELL SKIP] market {market_id}: size rounded to 0")
+            return None
+
+        attempts = 6
+        last_exc = None
+        for i in range(attempts):
+            try:
+                order = client.create_order(OrderArgs(
+                    token_id=token_id,
+                    price=order_price,
+                    size=size,
+                    side="SELL",
+                ))
+                resp = client.post_order(order, OrderType.GTC)
+                order_id = resp.get("orderID") or resp.get("id") or ""
+                print(f"  [CLOB SELL] market {market_id} | {size} YES @ ${order_price:.4f} | order {order_id}")
+                return order_id
+            except Exception as e:
+                last_exc = e
+                msg = str(e).lower()
+                # Common CLOB issue: wallet has slightly fewer shares than local state.
+                if "not enough balance / allowance" in msg and size > 0.01:
+                    bal_match = re.search(r"balance:\s*(\d+)", msg)
+                    ord_match = re.search(r"order amount:\s*(\d+)", msg)
+                    if bal_match and ord_match:
+                        bal_amt = int(bal_match.group(1))
+                        ord_amt = int(ord_match.group(1))
+                        if ord_amt > 0 and bal_amt > 0:
+                            ratio = max(0.0, min(1.0, bal_amt / ord_amt))
+                            next_size = math.floor((size * ratio * 0.98) * 100) / 100
+                            size = max(0.01, next_size)
+                            continue
+                    # Fallback: aggressively reduce size so we can discover fillable amount.
+                    size = max(0.01, math.floor((size * 0.5) * 100) / 100)
+                    continue
+                break
+
+        if last_exc is not None:
+            msg = str(last_exc)
+            if "not enough balance / allowance" in msg.lower():
+                print(
+                    "  [CLOB SELL HINT] Check proxy/funder signature type and set CTF allowances. "
+                    "Polymarket requires conditional-token approval for SELL."
+                )
+            raise last_exc
+    except Exception as e:
+        print(f"  [CLOB SELL ERROR] market {market_id}: {e}")
+        return None
+
 
 # =============================================================================
 # MARKET DATA STORAGE
@@ -681,15 +985,16 @@ def scan_and_update():
                 if bid is None or ask is None or mid_price is None:
                     continue
                 outcomes.append({
-                    "question":  question,
-                    "market_id": mid,
-                    "range":     rng,
-                    "bid":       round(bid, 4),
-                    "ask":       round(ask, 4),
-                    "price":     round(mid_price, 4),   # midpoint/mark
-                    "spread":    round(spread, 4),
-                    "has_book":  has_book,
-                    "volume":    round(volume, 0),
+                    "question":      question,
+                    "market_id":     mid,
+                    "clob_token_id": get_yes_token_id(market),
+                    "range":         rng,
+                    "bid":           round(bid, 4),
+                    "ask":           round(ask, 4),
+                    "price":         round(mid_price, 4),   # midpoint/mark
+                    "spread":        round(spread, 4),
+                    "has_book":      has_book,
+                    "volume":        round(volume, 0),
                 })
 
             outcomes.sort(key=lambda x: x["range"][0])
@@ -731,10 +1036,14 @@ def scan_and_update():
                         break
 
                 if current_price is not None:
-                    current_price = next(
-                        (x.get("bid", current_price) for x in outcomes if x["market_id"] == pos["market_id"]),
-                        current_price
-                    )  # sell at bid
+                    if REAL_TRADING:
+                        current_price = _live_executable_bid(outcomes, pos["market_id"])
+                    else:
+                        current_price = next(
+                            (x.get("bid", current_price) for x in outcomes if x["market_id"] == pos["market_id"]),
+                            current_price
+                        )  # paper mode: allow fallback to midpoint-ish price
+                if current_price is not None:
                     entry = pos["entry_price"]
                     stop  = pos.get("stop_price", entry * 0.80)  # 20% stop by default
 
@@ -745,6 +1054,14 @@ def scan_and_update():
 
                     # Check stop
                     if current_price <= stop:
+                        _sell_ok = True
+                        if REAL_TRADING:
+                            _tid = pos.get("clob_token_id")
+                            if _tid:
+                                _sell_ok = execute_sell(_tid, current_price, pos["shares"], str(pos["market_id"])) is not None
+                        if REAL_TRADING and not _sell_ok:
+                            print(f"  [HOLD LIVE] Sell failed for {loc['name']} {date}; keeping position open")
+                            continue
                         pnl = round((current_price - entry) * pos["shares"], 2)
                         balance += pos["cost"] + pnl
                         pos["closed_at"]    = snap.get("ts")
@@ -752,6 +1069,7 @@ def scan_and_update():
                         pos["exit_price"]   = current_price
                         pos["pnl"]          = pnl
                         pos["status"]       = "closed"
+                        mkt["status"]       = "closed"
                         closed += 1
                         reason = "STOP" if current_price < entry else "TRAILING BE"
                         print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
@@ -764,7 +1082,12 @@ def scan_and_update():
                 # 2-degree buffer — avoid closing on small forecast fluctuations
                 unit = loc["unit"]
                 buffer = 2.0 if unit == "F" else 1.0
-                mid_bucket = (old_bucket_low + old_bucket_high) / 2 if old_bucket_low != -999 and old_bucket_high != 999 else forecast_temp
+                if old_bucket_high == 999:       # upper tail e.g. "78°F or higher"
+                    mid_bucket = old_bucket_low
+                elif old_bucket_low == -999:     # lower tail e.g. "10°C or below"
+                    mid_bucket = old_bucket_high
+                else:
+                    mid_bucket = (old_bucket_low + old_bucket_high) / 2
                 forecast_far = abs(forecast_temp - mid_bucket) > (abs(mid_bucket - old_bucket_low) + buffer)
                 if not in_bucket(forecast_temp, old_bucket_low, old_bucket_high) and forecast_far:
                     current_price = None
@@ -773,10 +1096,22 @@ def scan_and_update():
                             current_price = o["price"]
                             break
                     if current_price is not None:
-                        current_price = next(
-                            (x.get("bid", current_price) for x in outcomes if x["market_id"] == pos["market_id"]),
-                            current_price
-                        )  # sell at bid
+                        if REAL_TRADING:
+                            current_price = _live_executable_bid(outcomes, pos["market_id"])
+                        else:
+                            current_price = next(
+                                (x.get("bid", current_price) for x in outcomes if x["market_id"] == pos["market_id"]),
+                                current_price
+                            )  # paper mode: allow fallback to midpoint-ish price
+                    if current_price is not None:
+                        _sell_ok = True
+                        if REAL_TRADING:
+                            _tid = pos.get("clob_token_id")
+                            if _tid:
+                                _sell_ok = execute_sell(_tid, current_price, pos["shares"], str(pos["market_id"])) is not None
+                        if REAL_TRADING and not _sell_ok:
+                            print(f"  [HOLD LIVE] Sell failed for {loc['name']} {date}; keeping position open")
+                            continue
                         pnl = round((current_price - pos["entry_price"]) * pos["shares"], 2)
                         balance += pos["cost"] + pnl
                         mkt["position"]["closed_at"]    = snap.get("ts")
@@ -784,6 +1119,7 @@ def scan_and_update():
                         mkt["position"]["exit_price"]   = current_price
                         mkt["position"]["pnl"]          = pnl
                         mkt["position"]["status"]       = "closed"
+                        mkt["status"] = "closed"
                         closed += 1
                         print(f"  [CLOSE] {loc['name']} {date} — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
 
@@ -830,43 +1166,65 @@ def scan_and_update():
 
                     kelly = calc_kelly(p, ask)
                     size  = bet_size(kelly, balance)
-                    if size < 0.50:
+                    if size < MIN_BET:
                         continue
 
                     best_signal = {
-                        "market_id":    o["market_id"],
-                        "question":     o["question"],
-                        "bucket_low":   t_low,
-                        "bucket_high":  t_high,
-                        "entry_price":  ask,       # enter at ask
-                        "bid_at_entry": bid,
-                        "spread":       spread,
-                        "shares":       round(size / ask, 2),
-                        "cost":         size,
-                        "p":            round(p, 4),
-                        "ev":           round(ev, 4),
-                        "kelly":        round(kelly, 4),
-                        "forecast_temp":forecast_temp,
-                        "forecast_src": best_source,
-                        "sigma":        sigma,
-                        "opened_at":    snap.get("ts"),
-                        "status":       "open",
-                        "pnl":          None,
-                        "exit_price":   None,
-                        "close_reason": None,
-                        "closed_at":    None,
+                        "market_id":     o["market_id"],
+                        "clob_token_id": o.get("clob_token_id"),
+                        "question":      o["question"],
+                        "bucket_low":    t_low,
+                        "bucket_high":   t_high,
+                        "entry_price":   ask,       # enter at ask
+                        "bid_at_entry":  bid,
+                        "spread":        spread,
+                        "shares":        round(size / ask, 2),
+                        "cost":          size,
+                        "p":             round(p, 4),
+                        "ev":            round(ev, 4),
+                        "kelly":         round(kelly, 4),
+                        "forecast_temp": forecast_temp,
+                        "forecast_src":  best_source,
+                        "sigma":         sigma,
+                        "opened_at":     snap.get("ts"),
+                        "status":        "open",
+                        "pnl":           None,
+                        "exit_price":    None,
+                        "close_reason":  None,
+                        "closed_at":     None,
+                        "buy_order_id":  None,
                     }
                     break
 
                 if best_signal:
-                    balance -= best_signal["cost"]
-                    mkt["position"] = best_signal
-                    state["total_trades"] += 1
-                    new_pos += 1
-                    bucket_label = f"{best_signal['bucket_low']}-{best_signal['bucket_high']}{unit_sym}"
-                    print(f"  [BUY]  {loc['name']} {horizon} {date} | {bucket_label} | "
-                          f"${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f} | "
-                          f"${best_signal['cost']:.2f} ({best_signal['forecast_src'].upper()})")
+                    _open = True
+                    if REAL_TRADING:
+                        _tid = best_signal.get("clob_token_id")
+                        if not _tid:
+                            print(f"  [SKIP LIVE] No CLOB token ID for {loc['name']} {date} — skipping")
+                            _open = False
+                        else:
+                            _oid = execute_buy(
+                                _tid,
+                                best_signal["entry_price"],
+                                best_signal["cost"],
+                                best_signal["market_id"],
+                            )
+                            if _oid is None:
+                                print(f"  [SKIP LIVE] Buy order failed for {loc['name']} {date}")
+                                _open = False
+                            else:
+                                best_signal["buy_order_id"] = _oid
+                    if _open:
+                        balance -= best_signal["cost"]
+                        mkt["position"] = best_signal
+                        state["total_trades"] += 1
+                        new_pos += 1
+                        bucket_label = f"{best_signal['bucket_low']}-{best_signal['bucket_high']}{unit_sym}"
+                        mode_tag = "BUY LIVE" if REAL_TRADING else "BUY"
+                        print(f"  [{mode_tag}]  {loc['name']} {horizon} {date} | {bucket_label} | "
+                              f"${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f} | "
+                              f"${best_signal['cost']:.2f} ({best_signal['forecast_src'].upper()})")
 
             # Market closed by time
             if hours < 0.5 and mkt["status"] == "open":
@@ -1323,8 +1681,6 @@ def print_health():
 # MAIN LOOP
 # =============================================================================
 
-MONITOR_INTERVAL = 600  # monitor positions every 10 minutes
-
 def monitor_positions():
     """Stop / trailing check between full scans using fresh Gamma bid/ask per position."""
     markets  = load_all_markets()
@@ -1345,7 +1701,8 @@ def monitor_positions():
         if book:
             bid, ask, mid_price, spread, has_book = extract_yes_quotes(book)
             if bid is not None and ask is not None:
-                current_price = bid
+                if has_book and 0.001 <= bid <= 0.999:
+                    current_price = bid
                 for o in mkt.get("all_outcomes", []):
                     if str(o.get("market_id")) == mid:
                         o["bid"] = round(bid, 4)
@@ -1358,10 +1715,13 @@ def monitor_positions():
                 save_market(mkt)
 
         if current_price is None:
-            for o in mkt.get("all_outcomes", []):
-                if str(o.get("market_id")) == mid:
-                    current_price = o.get("bid", o.get("price"))
-                    break
+            if REAL_TRADING:
+                current_price = _live_executable_bid(mkt.get("all_outcomes", []), mid)
+            else:
+                for o in mkt.get("all_outcomes", []):
+                    if str(o.get("market_id")) == mid:
+                        current_price = o.get("bid", o.get("price"))
+                        break
 
         if current_price is None:
             continue
@@ -1379,6 +1739,15 @@ def monitor_positions():
 
         # Check stop
         if current_price <= stop:
+            _sell_ok = True
+            if REAL_TRADING:
+                _tid = pos.get("clob_token_id")
+                if _tid:
+                    _sell_ok = execute_sell(_tid, current_price, pos["shares"], str(pos["market_id"])) is not None
+            if REAL_TRADING and not _sell_ok:
+                city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
+                print(f"  [HOLD LIVE] Sell failed for {city_name} {mkt['date']}; keeping position open")
+                continue
             pnl = round((current_price - entry) * pos["shares"], 2)
             balance += pos["cost"] + pnl
             pos["closed_at"]    = datetime.now(timezone.utc).isoformat()
@@ -1386,6 +1755,7 @@ def monitor_positions():
             pos["exit_price"]   = current_price
             pos["pnl"]          = pnl
             pos["status"]       = "closed"
+            mkt["status"]       = "closed"
             closed += 1
             reason = "STOP" if current_price < entry else "TRAILING BE"
             city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
@@ -1407,15 +1777,19 @@ def run_loop():
     global _cal
     _cal = load_cal()
 
+    mode_label = "LIVE (real orders via Polymarket CLOB)" if REAL_TRADING else "PAPER (simulation only)"
     print(f"\n{'='*55}")
     print(f"  WEATHERBET — STARTING")
     print(f"{'='*55}")
+    print(f"  Mode:       {mode_label}")
     print(f"  Cities:     {len(LOCATIONS)}")
     print(f"  Balance:    ${BALANCE:,.0f} | Max bet: ${MAX_BET}")
     print(f"  Scan:       {SCAN_INTERVAL//60} min | Monitor: {MONITOR_INTERVAL//60} min")
     print(f"  Sources:    ECMWF + US gfs_seamless + METAR(D+0)")
     print(f"  Data:       {DATA_DIR.resolve()}")
     print(f"  Ctrl+C to stop\n")
+    if REAL_TRADING:
+        _get_clob_client()  # fail fast if key/lib missing
 
     last_full_scan = 0
 
