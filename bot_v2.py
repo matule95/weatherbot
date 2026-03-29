@@ -96,6 +96,8 @@ POLY_FUNDER = str(POLY_FUNDER).strip()
 SIGMA_F = 2.0
 SIGMA_C = 1.2
 
+HORIZON_SIGMA_SCALE = {0: 0.6, 1: 1.0, 2: 1.4, 3: 1.8}
+
 DATA_DIR         = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 STATE_FILE       = DATA_DIR / "state.json"
@@ -917,6 +919,10 @@ def take_forecast_snapshot(city_slug, dates):
         else:
             snap["best"] = None
             snap["best_source"] = None
+        if snap["ecmwf"] is not None and us_val is not None:
+            snap["source_spread"] = abs(snap["ecmwf"] - us_val)
+        else:
+            snap["source_spread"] = 0
         snapshots[date] = snap
     return snapshots
 
@@ -1026,54 +1032,6 @@ def scan_and_update():
             forecast_temp = snap.get("best")
             best_source   = snap.get("best_source")
 
-            # --- STOP-LOSS AND TRAILING STOP ---
-            if mkt.get("position") and mkt["position"].get("status") == "open":
-                pos = mkt["position"]
-                current_price = None
-                for o in outcomes:
-                    if o["market_id"] == pos["market_id"]:
-                        current_price = o["price"]
-                        break
-
-                if current_price is not None:
-                    if REAL_TRADING:
-                        current_price = _live_executable_bid(outcomes, pos["market_id"])
-                    else:
-                        current_price = next(
-                            (x.get("bid", current_price) for x in outcomes if x["market_id"] == pos["market_id"]),
-                            current_price
-                        )  # paper mode: allow fallback to midpoint-ish price
-                if current_price is not None:
-                    entry = pos["entry_price"]
-                    stop  = pos.get("stop_price", entry * 0.80)  # 20% stop by default
-
-                    # Trailing: if up 20%+ — move stop to breakeven
-                    if current_price >= entry * 1.20 and stop < entry:
-                        pos["stop_price"] = entry
-                        pos["trailing_activated"] = True
-
-                    # Check stop
-                    if current_price <= stop:
-                        _sell_ok = True
-                        if REAL_TRADING:
-                            _tid = pos.get("clob_token_id")
-                            if _tid:
-                                _sell_ok = execute_sell(_tid, current_price, pos["shares"], str(pos["market_id"])) is not None
-                        if REAL_TRADING and not _sell_ok:
-                            print(f"  [HOLD LIVE] Sell failed for {loc['name']} {date}; keeping position open")
-                            continue
-                        pnl = round((current_price - entry) * pos["shares"], 2)
-                        balance += pos["cost"] + pnl
-                        pos["closed_at"]    = snap.get("ts")
-                        pos["close_reason"] = "stop_loss" if current_price < entry else "trailing_stop"
-                        pos["exit_price"]   = current_price
-                        pos["pnl"]          = pnl
-                        pos["status"]       = "closed"
-                        mkt["status"]       = "closed"
-                        closed += 1
-                        reason = "STOP" if current_price < entry else "TRAILING BE"
-                        print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
-
             # --- CLOSE POSITION if forecast shifted 2+ degrees ---
             if mkt.get("position") and forecast_temp is not None:
                 pos = mkt["position"]
@@ -1125,8 +1083,11 @@ def scan_and_update():
 
             # --- OPEN POSITION ---
             if not mkt.get("position") and forecast_temp is not None and hours >= MIN_HOURS:
-                sigma = get_sigma(city_slug, best_source or "ecmwf")
-                best_signal = None
+                sigma = get_sigma(city_slug, best_source or "ecmwf") * HORIZON_SIGMA_SCALE.get(i, 1.5)
+                source_spread = snap.get("source_spread", 0)
+                if source_spread > 0:
+                    sigma *= 1.0 + 0.15 * source_spread
+                candidates = []
 
                 for o in outcomes:
                     t_low, t_high = o["range"]
@@ -1169,7 +1130,7 @@ def scan_and_update():
                     if size < MIN_BET:
                         continue
 
-                    best_signal = {
+                    candidates.append({
                         "market_id":     o["market_id"],
                         "clob_token_id": o.get("clob_token_id"),
                         "question":      o["question"],
@@ -1193,9 +1154,9 @@ def scan_and_update():
                         "close_reason":  None,
                         "closed_at":     None,
                         "buy_order_id":  None,
-                    }
-                    break
+                    })
 
+                best_signal = max(candidates, key=lambda s: s["ev"]) if candidates else None
                 if best_signal:
                     _open = True
                     if REAL_TRADING:
@@ -1226,7 +1187,34 @@ def scan_and_update():
                               f"${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f} | "
                               f"${best_signal['cost']:.2f} ({best_signal['forecast_src'].upper()})")
 
-            # Market closed by time
+            # Time-decay exit: close position before resolution liquidity dries up
+            if hours < 1.0 and mkt.get("position") and mkt["position"].get("status") == "open":
+                pos = mkt["position"]
+                current_bid = None
+                for o in outcomes:
+                    if o["market_id"] == pos["market_id"]:
+                        current_bid = o.get("bid", o["price"])
+                        break
+                if REAL_TRADING:
+                    current_bid = _live_executable_bid(outcomes, pos["market_id"]) or current_bid
+                if current_bid is not None:
+                    _sell_ok = True
+                    if REAL_TRADING:
+                        _tid = pos.get("clob_token_id")
+                        if _tid:
+                            _sell_ok = execute_sell(_tid, current_bid, pos["shares"], str(pos["market_id"])) is not None
+                    if not REAL_TRADING or _sell_ok:
+                        pnl = round((current_bid - pos["entry_price"]) * pos["shares"], 2)
+                        balance += pos["cost"] + pnl
+                        pos["closed_at"]    = snap.get("ts")
+                        pos["close_reason"] = "time_decay"
+                        pos["exit_price"]   = current_bid
+                        pos["pnl"]          = pnl
+                        pos["status"]       = "closed"
+                        mkt["status"]       = "closed"
+                        closed += 1
+                        print(f"  [TIME DECAY] {loc['name']} {date} | entry ${pos['entry_price']:.3f} exit ${current_bid:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+
             if hours < 0.5 and mkt["status"] == "open":
                 mkt["status"] = "closed"
 
@@ -1682,7 +1670,7 @@ def print_health():
 # =============================================================================
 
 def monitor_positions():
-    """Stop / trailing check between full scans using fresh Gamma bid/ask per position."""
+    """Refresh quotes and check time-decay exits between full scans."""
     markets  = load_all_markets()
     open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
     if not open_pos:
@@ -1696,13 +1684,10 @@ def monitor_positions():
         pos = mkt["position"]
         mid = str(pos["market_id"])
 
-        current_price = None
         book = fetch_gamma_market(mid)
         if book:
             bid, ask, mid_price, spread, has_book = extract_yes_quotes(book)
             if bid is not None and ask is not None:
-                if has_book and 0.001 <= bid <= 0.999:
-                    current_price = bid
                 for o in mkt.get("all_outcomes", []):
                     if str(o.get("market_id")) == mid:
                         o["bid"] = round(bid, 4)
@@ -1714,53 +1699,34 @@ def monitor_positions():
                 pos["last_monitor_quote_ts"] = datetime.now(timezone.utc).isoformat()
                 save_market(mkt)
 
-        if current_price is None:
+        hours = hours_to_resolution(mkt.get("event_end_date", ""))
+        if hours < 1.0 and pos.get("status") == "open":
+            current_bid = None
+            for o in mkt.get("all_outcomes", []):
+                if str(o.get("market_id")) == mid:
+                    current_bid = o.get("bid", o.get("price"))
+                    break
             if REAL_TRADING:
-                current_price = _live_executable_bid(mkt.get("all_outcomes", []), mid)
-            else:
-                for o in mkt.get("all_outcomes", []):
-                    if str(o.get("market_id")) == mid:
-                        current_price = o.get("bid", o.get("price"))
-                        break
-
-        if current_price is None:
-            continue
-
-        entry = pos["entry_price"]
-        stop  = pos.get("stop_price", entry * 0.80)
-
-        # Trailing: if up 20%+ — move stop to breakeven
-        if current_price >= entry * 1.20 and stop < entry:
-            pos["stop_price"] = entry
-            pos["trailing_activated"] = True
-            city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
-            print(f"  [TRAILING] {city_name} {mkt['date']} — stop moved to breakeven ${entry:.3f}")
-            save_market(mkt)
-
-        # Check stop
-        if current_price <= stop:
-            _sell_ok = True
-            if REAL_TRADING:
-                _tid = pos.get("clob_token_id")
-                if _tid:
-                    _sell_ok = execute_sell(_tid, current_price, pos["shares"], str(pos["market_id"])) is not None
-            if REAL_TRADING and not _sell_ok:
-                city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
-                print(f"  [HOLD LIVE] Sell failed for {city_name} {mkt['date']}; keeping position open")
-                continue
-            pnl = round((current_price - entry) * pos["shares"], 2)
-            balance += pos["cost"] + pnl
-            pos["closed_at"]    = datetime.now(timezone.utc).isoformat()
-            pos["close_reason"] = "stop_loss" if current_price < entry else "trailing_stop"
-            pos["exit_price"]   = current_price
-            pos["pnl"]          = pnl
-            pos["status"]       = "closed"
-            mkt["status"]       = "closed"
-            closed += 1
-            reason = "STOP" if current_price < entry else "TRAILING BE"
-            city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
-            print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
-            save_market(mkt)
+                current_bid = _live_executable_bid(mkt.get("all_outcomes", []), mid) or current_bid
+            if current_bid is not None:
+                _sell_ok = True
+                if REAL_TRADING:
+                    _tid = pos.get("clob_token_id")
+                    if _tid:
+                        _sell_ok = execute_sell(_tid, current_bid, pos["shares"], str(pos["market_id"])) is not None
+                if not REAL_TRADING or _sell_ok:
+                    pnl = round((current_bid - pos["entry_price"]) * pos["shares"], 2)
+                    balance += pos["cost"] + pnl
+                    pos["closed_at"]    = datetime.now(timezone.utc).isoformat()
+                    pos["close_reason"] = "time_decay"
+                    pos["exit_price"]   = current_bid
+                    pos["pnl"]          = pnl
+                    pos["status"]       = "closed"
+                    mkt["status"]       = "closed"
+                    closed += 1
+                    city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
+                    print(f"  [TIME DECAY] {city_name} {mkt['date']} | entry ${pos['entry_price']:.3f} exit ${current_bid:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                    save_market(mkt)
 
         if idx + 1 < len(open_pos):
             time.sleep(0.12)
