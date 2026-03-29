@@ -648,6 +648,9 @@ def execute_buy(token_id, price, cost, market_id):
     """
     if not REAL_TRADING:
         return None
+    if cost < 1.0:
+        print(f"  [CLOB BUY SKIP] market {market_id}: order ${cost:.2f} below $1 CLOB minimum")
+        return None
     try:
         client = _get_clob_client()
         from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
