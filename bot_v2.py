@@ -679,6 +679,9 @@ def execute_sell(token_id, price, shares, market_id):
     """
     if not REAL_TRADING:
         return None
+    if shares < 5.0:
+        print(f"  [CLOB SELL SKIP] market {market_id}: {shares:.2f} shares below 5-share CLOB minimum")
+        return None
     try:
         client = _get_clob_client()
         from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
@@ -1130,6 +1133,12 @@ def scan_and_update():
 
                     kelly = calc_kelly(p, ask)
                     size  = bet_size(kelly, balance)
+                    min_clob_cost = math.ceil(5 * ask * 100) / 100
+                    if size < min_clob_cost:
+                        if min_clob_cost <= MAX_BET and min_clob_cost <= balance:
+                            size = min_clob_cost
+                        else:
+                            continue
                     if size < MIN_BET:
                         continue
 
