@@ -176,14 +176,33 @@ def place_buy_order(token_id: str, cost: float) -> dict | None:
 def place_sell_order(token_id: str, size: float, price: float) -> dict | None:
     """
     Place a limit FAK SELL order for `size` shares at `price`.
+    Queries actual conditional token balance first and caps size to what's
+    available, preventing "not enough balance" errors from partial fills.
     Returns the response dict on success, None on failure.
     """
     client = get_clob_client()
+
+    # Check actual on-chain token balance before attempting sell
+    actual_size = round(size, 2)
+    try:
+        bal_resp = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+        )
+        available = float(bal_resp["balance"]) / 1e6
+        if available < 1.0:
+            print(f"  [SELL] Token balance too low ({available:.2f} shares), skipping")
+            return None
+        if available < actual_size:
+            print(f"  [SELL] Capping size {actual_size:.2f} → {available:.2f} (partial fill on buy)")
+            actual_size = round(available, 2)
+    except Exception as e:
+        print(f"  [SELL] Could not check token balance: {e} — using recorded size")
+
     try:
         sell_args = OrderArgs(
             token_id=token_id,
             price=round(price, 4),
-            size=round(size, 2),
+            size=actual_size,
             side=SELL,
         )
         signed = client.create_order(sell_args)
