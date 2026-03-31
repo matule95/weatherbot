@@ -30,7 +30,10 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType, ApiCreds
+from py_clob_client.clob_types import (
+    MarketOrderArgs, OrderArgs, OrderType, ApiCreds,
+    BalanceAllowanceParams, AssetType,
+)
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # =============================================================================
@@ -144,8 +147,10 @@ def get_clob_client() -> ClobClient:
 def get_real_balance() -> float | None:
     """Fetch available USDC balance from Polymarket wallet."""
     try:
-        bal_wei = get_clob_client().get_balance()
-        return float(bal_wei) / 1e6
+        resp = get_clob_client().get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        return float(resp["balance"]) / 1e6
     except Exception as e:
         print(f"  [BALANCE] Error fetching real balance: {e}")
         return None
@@ -732,7 +737,7 @@ def scan_and_update():
                         if ev >= MIN_EV:
                             kelly = calc_kelly(p, ask)
                             size  = bet_size(kelly, balance)
-                            if size >= 0.50:
+                            if size >= 1.00:
                                 best_signal = {
                                     "market_id":    o["market_id"],
                                     "token_id":     o["token_id"],
