@@ -976,19 +976,9 @@ def scan_and_update():
     global _cal
     now      = datetime.now(timezone.utc)
     state    = load_state()
-    balance  = state["balance"]
-
+    balance  = _sync_state_balance(state)
     if REAL_TRADING:
-        try:
-            _client = _get_clob_client()
-            live_bal = _get_wallet_usdc_balance(_client)
-            if live_bal is not None:
-                balance = live_bal
-                print(f"  [LIVE BALANCE] ${balance:,.2f} USDC from wallet")
-            else:
-                print(f"  [LIVE BALANCE WARN] Could not read wallet balance; using state ${balance:,.2f}")
-        except Exception as _e:
-            print(f"  [LIVE BALANCE WARN] {_e}; using state ${balance:,.2f}")
+        print(f"  [LIVE BALANCE] ${balance:,.2f} USDC from wallet")
     new_pos  = 0
     closed   = 0
     resolved = 0
@@ -1336,7 +1326,7 @@ def scan_and_update():
         save_market(mkt)
         time.sleep(0.3)
 
-    state["balance"]      = round(balance, 2)
+    balance               = _sync_state_balance(state)
     state["peak_balance"] = max(state.get("peak_balance", balance), balance)
     state["last_scan"]    = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -1732,6 +1722,24 @@ def print_health():
 # MAIN LOOP
 # =============================================================================
 
+def _sync_state_balance(state):
+    """
+    In live mode, overwrite state['balance'] with the actual wallet USDC balance.
+    No-op in paper mode. Returns the balance used.
+    """
+    if not REAL_TRADING:
+        return state["balance"]
+    try:
+        client = _get_clob_client()
+        live_bal = _get_wallet_usdc_balance(client)
+        if live_bal is not None:
+            state["balance"] = live_bal
+            return live_bal
+    except Exception as _e:
+        print(f"  [LIVE BALANCE WARN] {_e}")
+    return state["balance"]
+
+
 def monitor_positions():
     """Refresh quotes and check time-decay exits between full scans."""
     markets  = load_all_markets()
@@ -1740,7 +1748,7 @@ def monitor_positions():
         return 0
 
     state   = load_state()
-    balance = state["balance"]
+    balance = _sync_state_balance(state)
     closed  = 0
 
     for idx, mkt in enumerate(open_pos):
@@ -1795,7 +1803,7 @@ def monitor_positions():
             time.sleep(0.12)
 
     if closed:
-        state["balance"] = round(balance, 2)
+        _sync_state_balance(state)
         save_state(state)
 
     write_simulation_export()
