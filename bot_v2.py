@@ -52,7 +52,7 @@ _cfg = _load_config()
 
 BALANCE          = _cfg.get("balance", 10000.0)
 MAX_BET          = _cfg.get("max_bet", 20.0)        # max order size
-MIN_BET          = _cfg.get("min_bet", 0.50)        # min order size
+MIN_BET          = _cfg.get("min_bet", 1.0)         # min order size
 MIN_EV           = _cfg.get("min_ev", 0.10)
 MAX_PRICE        = _cfg.get("max_price", 0.45)
 MIN_VOLUME       = _cfg.get("min_volume", 500)
@@ -520,6 +520,42 @@ def _get_live_sellable_shares(client, token_id, requested_shares, market_id):
         print(f"  [CLOB SELL PRECHECK WARN] market {market_id}: {e}")
         return None
 
+
+def _get_wallet_usdc_balance(client):
+    """
+    Fetch the actual USDC (collateral) balance from the Polymarket wallet.
+    Returns balance as a float (dollars), or None if unavailable.
+    USDC on Polygon uses 6 decimal places; the CLOB API returns raw integer units.
+    """
+    try:
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType  # type: ignore
+
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+            signature_type=POLY_SIGNATURE_TYPE,
+        )
+        try:
+            client.update_balance_allowance(params)
+        except Exception:
+            pass
+        info = client.get_balance_allowance(params)
+        if not isinstance(info, (dict, list)):
+            return None
+
+        bal_vals = _extract_named_numbers(info, re.compile(r"balance", re.IGNORECASE))
+        if not bal_vals:
+            return None
+
+        raw = max(bal_vals)
+        # USDC on Polygon: 6 decimals → raw units are 1e6× the dollar amount.
+        # Heuristic: if raw >> any plausible dollar balance, assume 1e6-scaled.
+        usdc = raw / 1_000_000.0 if raw > BALANCE * 100 else raw
+        return round(usdc, 2)
+    except Exception as e:
+        print(f"  [CLOB BALANCE WARN] Could not fetch wallet USDC balance: {e}")
+        return None
+
+
 def extract_yes_quotes(market):
     """
     Returns YES-side executable quote tuple: (bid, ask, mid, spread, is_valid).
@@ -679,8 +715,8 @@ def execute_sell(token_id, price, shares, market_id):
     """
     if not REAL_TRADING:
         return None
-    if shares < 5.0:
-        print(f"  [CLOB SELL SKIP] market {market_id}: {shares:.2f} shares below 5-share CLOB minimum")
+    if shares < 1.0:
+        print(f"  [CLOB SELL SKIP] market {market_id}: {shares:.2f} shares below 1.0 share minimum")
         return None
     try:
         client = _get_clob_client()
@@ -696,6 +732,9 @@ def execute_sell(token_id, price, shares, market_id):
             size = checked_size
         if size <= 0:
             print(f"  [CLOB SELL SKIP] market {market_id}: size rounded to 0")
+            return None
+        if size < 1.0:
+            print(f"  [CLOB SELL SKIP] market {market_id}: on-chain balance {size:.4f} shares below 1.0 share minimum")
             return None
 
         attempts = 6
@@ -938,6 +977,18 @@ def scan_and_update():
     now      = datetime.now(timezone.utc)
     state    = load_state()
     balance  = state["balance"]
+
+    if REAL_TRADING:
+        try:
+            _client = _get_clob_client()
+            live_bal = _get_wallet_usdc_balance(_client)
+            if live_bal is not None:
+                balance = live_bal
+                print(f"  [LIVE BALANCE] ${balance:,.2f} USDC from wallet")
+            else:
+                print(f"  [LIVE BALANCE WARN] Could not read wallet balance; using state ${balance:,.2f}")
+        except Exception as _e:
+            print(f"  [LIVE BALANCE WARN] {_e}; using state ${balance:,.2f}")
     new_pos  = 0
     closed   = 0
     resolved = 0
@@ -1133,7 +1184,7 @@ def scan_and_update():
 
                     kelly = calc_kelly(p, ask)
                     size  = bet_size(kelly, balance)
-                    min_clob_cost = math.ceil(5 * ask * 100) / 100
+                    min_clob_cost = math.ceil(1 * ask * 100) / 100
                     if size < min_clob_cost:
                         if min_clob_cost <= MAX_BET and min_clob_cost <= balance:
                             size = min_clob_cost
