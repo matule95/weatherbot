@@ -193,8 +193,9 @@ def place_sell_order(token_id: str, size: float, price: float) -> dict | None:
             print(f"  [SELL] Token balance too low ({available:.2f} shares), skipping")
             return None
         if available < actual_size:
-            print(f"  [SELL] Capping size {actual_size:.2f} → {available:.2f} (partial fill on buy)")
-            actual_size = round(available, 2)
+            floored = math.floor(available * 100) / 100
+            print(f"  [SELL] Capping size {actual_size:.2f} → {floored:.2f} (partial fill on buy)")
+            actual_size = floored
     except Exception as e:
         print(f"  [SELL] Could not check token balance: {e} — using recorded size")
 
