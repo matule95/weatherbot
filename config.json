@@ -9,6 +9,19 @@
   "kelly_fraction": 0.25,
   "scan_interval": 3600,
   "calibration_min": 30,
-  "vc_key": "YOUR_KEY_HERE",
-  "max_slippage": 0.03
+  "max_slippage": 0.03,
+  "prior_weight": 10,
+  "max_positions_per_event": 1,
+  "tune_lookback": 100,
+  "tune_enabled": true,
+  "max_open_positions": 15,
+  "max_positions_per_date": 6,
+  "vc_key": "",
+  "polymarket_private_key": "",
+  "polymarket_api_key": "",
+  "polymarket_api_secret": "",
+  "polymarket_api_passphrase": "",
+  "polymarket_funder": "",
+  "chain_id": 137,
+  "signature_type": 0
 }
