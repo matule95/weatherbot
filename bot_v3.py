@@ -420,7 +420,10 @@ def get_metar(city_slug):
     unit = loc["unit"]
     try:
         url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=json"
-        data = requests.get(url, timeout=(5, 8)).json()
+        resp = requests.get(url, timeout=(5, 8))
+        if not resp.text or not resp.text.strip():
+            return None
+        data = resp.json()
         if data and isinstance(data, list):
             temp_c = data[0].get("temp")
             if temp_c is not None:
