@@ -1,0 +1,62 @@
+{
+  "balance": 30.0,
+  "max_bet": 250.0,
+  "min_ev": 0.06,
+  "max_price": 0.55,
+  "min_volume": 200,
+  "min_hours": 2.0,
+  "max_hours": 60.0,
+  "kelly_fraction": 0.25,
+  "scan_interval": 2400,
+  "calibration_min": 5,
+  "max_slippage": 0.05,
+  "prior_weight": 8,
+  "max_positions_per_event": 1,
+  "tune_lookback": 50,
+  "tune_enabled": true,
+  "max_open_positions": 20,
+  "max_positions_per_date": 3,
+  "vc_key": "",
+  "polymarket_private_key": "",
+  "polymarket_funder": "",
+  "chain_id": 137,
+  "signature_type": 1,
+
+  "coins": {
+    "BTC": {
+      "max_bet": 25.0,
+      "kelly_fraction": 0.25,
+      "annual_vol": 0.6,
+      "min_drift": 0.001
+    },
+    "ETH": {
+      "max_bet": 25.0,
+      "kelly_fraction": 0.25,
+      "annual_vol": 0.8,
+      "min_drift": 0.001
+    },
+    "SOL": {
+      "max_bet": 25.0,
+      "kelly_fraction": 0.2,
+      "annual_vol": 1.2,
+      "min_drift": 0.002
+    },
+    "XRP": {
+      "max_bet": 25.0,
+      "kelly_fraction": 0.25,
+      "annual_vol": 0.9,
+      "min_drift": 0.001
+    }
+  },
+
+  "btc_min_ev": 0.06,
+  "btc_min_drift": 0.001,
+  "btc_min_liquidity": 300,
+  "btc_max_bet": 25.0,
+  "btc_kelly_fraction": 0.25,
+  "btc_entry_window_min_sec": 90,
+  "btc_entry_window_max_sec": 660,
+  "btc_annual_vol": 0.6,
+  "btc_tune_lookback": 30,
+  "btc_prior_weight": 10
+}
