@@ -64,7 +64,8 @@ TAKE_PROFIT_SHORT= _cfg.get("take_profit_short", 0.85)  # 24-48h remaining
 TAKE_PROFIT_LONG = _cfg.get("take_profit_long", 0.75)   # >48h remaining
 TAKE_PROFIT_FINAL= _cfg.get("take_profit_final", 0.50)  # <24h remaining
 TAKE_PROFIT_ROI  = _cfg.get("take_profit_roi", 0.40)    # sell when price >= entry * (1 + ROI)
-SCAN_REGIONS     = set(_cfg.get("scan_regions", ["eu"]))
+SCAN_REGIONS          = set(_cfg.get("scan_regions", ["eu"]))
+MAX_CYCLES_PER_MARKET = _cfg.get("max_cycles_per_market", 3)
 
 # CLOB credentials
 POLYMARKET_HOST    = "https://clob.polymarket.com"
@@ -79,7 +80,7 @@ POLY_SIG_TYPE      = _cfg.get("signature_type", 0)
 SIGMA_F = 2.0
 SIGMA_C = 1.2
 
-DATA_DIR         = Path("data_v3")
+DATA_DIR         = Path("weather_bot_data")
 DATA_DIR.mkdir(exist_ok=True)
 STATE_FILE       = DATA_DIR / "state.json"
 MARKETS_DIR      = DATA_DIR / "markets"
@@ -655,7 +656,7 @@ def new_market(city_slug, date_str, event, hours):
         "event_end_date":     event.get("endDate", ""),
         "hours_at_discovery": round(hours, 1),
         "status":             "open",
-        "position":           None,
+        "cycles":             [],
         "actual_temp":        None,
         "resolved_outcome":   None,
         "pnl":                None,
@@ -664,6 +665,13 @@ def new_market(city_slug, date_str, event, hours):
         "all_outcomes":       [],
         "created_at":         datetime.now(timezone.utc).isoformat(),
     }
+
+def get_active_cycle(market_data):
+    """Return the currently open cycle dict, or None if no open cycle exists."""
+    for cycle in market_data.get("cycles", []):
+        if cycle.get("status") == "open":
+            return cycle
+    return None
 
 # =============================================================================
 # STATE
@@ -838,27 +846,49 @@ def scan_and_update():
 
             # --- RECONCILE: detect on-chain positions not tracked locally ---
             if mkt["status"] != "resolved":
-                pos = mkt.get("position")
-                need_reconcile = pos is None or pos.get("status") != "open"
+                pos = get_active_cycle(mkt)
+                need_reconcile = pos is None
                 if need_reconcile and outcomes:
-                    if pos is not None and pos.get("token_id"):
-                        onchain = get_token_balance(pos["token_id"])
+                    # Check last closed cycle's token first, then scan all outcomes
+                    cycles = mkt.get("cycles", [])
+                    last_cycle = cycles[-1] if cycles else None
+                    if last_cycle and last_cycle.get("token_id"):
+                        onchain = get_token_balance(last_cycle["token_id"])
                         if onchain >= 1.0:
-                            matching = next((o for o in outcomes if o.get("token_id") == pos["token_id"]), None)
-                            cp = matching["price"] if matching else pos.get("exit_price", pos["entry_price"])
-                            real_entry = get_real_entry_price(pos["token_id"])
+                            matching = next((o for o in outcomes if o.get("token_id") == last_cycle["token_id"]), None)
+                            cp = matching["price"] if matching else last_cycle.get("exit_price", last_cycle["entry_price"])
+                            real_entry = get_real_entry_price(last_cycle["token_id"])
                             entry = real_entry if real_entry is not None else cp
-                            print(f"  [RECONCILE] {loc['name']} {date} — {onchain:.1f} orphaned shares on-chain "
+                            cycle_num = len(cycles) + 1
+                            print(f"  [RECONCILE] {loc['name']} {date} [C{cycle_num}] — {onchain:.1f} orphaned shares on-chain "
                                   f"(entry ${entry:.4f}, market ${cp:.3f})")
-                            pos["shares"]       = round(onchain, 2)
-                            pos["entry_price"]  = entry
-                            pos["cost"]         = round(onchain * entry, 2)
-                            pos["status"]       = "open"
-                            pos["pnl"]          = None
-                            pos["exit_price"]   = None
-                            pos["close_reason"] = None
-                            pos["closed_at"]    = None
-                            pos["reconciled"]   = True
+                            mkt["cycles"].append({
+                                "cycle_num":          cycle_num,
+                                "market_id":          last_cycle["market_id"],
+                                "token_id":           last_cycle["token_id"],
+                                "question":           last_cycle.get("question"),
+                                "bucket_low":         last_cycle["bucket_low"],
+                                "bucket_high":        last_cycle["bucket_high"],
+                                "entry_price":        entry,
+                                "shares":             round(onchain, 2),
+                                "cost":               round(onchain * entry, 2),
+                                "p":                  None,
+                                "ev":                 None,
+                                "kelly":              None,
+                                "forecast_temp":      forecast_temp,
+                                "forecast_src":       best_source,
+                                "sigma":              None,
+                                "opened_at":          snap.get("ts"),
+                                "status":             "open",
+                                "pnl":                None,
+                                "exit_price":         None,
+                                "close_reason":       None,
+                                "closed_at":          None,
+                                "order_id":           None,
+                                "stop_price":         round(entry * STOP_LOSS_PCT, 4),
+                                "trailing_activated": False,
+                                "reconciled":         True,
+                            })
                     else:
                         for o in outcomes:
                             tid = o.get("token_id")
@@ -870,38 +900,42 @@ def scan_and_update():
                                 t_low, t_high = o["range"]
                                 real_entry = get_real_entry_price(tid)
                                 entry = real_entry if real_entry is not None else cp
-                                print(f"  [RECONCILE] {loc['name']} {date} — {onchain:.1f} on-chain shares "
+                                cycle_num = len(mkt.get("cycles", [])) + 1
+                                print(f"  [RECONCILE] {loc['name']} {date} [C{cycle_num}] — {onchain:.1f} on-chain shares "
                                       f"({t_low}-{t_high}{unit_sym}) entry ${entry:.4f}, market ${cp:.3f}")
-                                mkt["position"] = {
-                                    "market_id":    o["market_id"],
-                                    "token_id":     tid,
-                                    "question":     o["question"],
-                                    "bucket_low":   t_low,
-                                    "bucket_high":  t_high,
-                                    "entry_price":  entry,
-                                    "shares":       round(onchain, 2),
-                                    "cost":         round(onchain * entry, 2),
-                                    "p":            None,
-                                    "ev":           None,
-                                    "kelly":        None,
-                                    "forecast_temp": forecast_temp,
-                                    "forecast_src":  best_source,
-                                    "sigma":        None,
-                                    "opened_at":    snap.get("ts"),
-                                    "status":       "open",
-                                    "pnl":          None,
-                                    "exit_price":   None,
-                                    "close_reason": None,
-                                    "closed_at":    None,
-                                    "order_id":     None,
-                                    "reconciled":   True,
-                                }
+                                mkt["cycles"].append({
+                                    "cycle_num":          cycle_num,
+                                    "market_id":          o["market_id"],
+                                    "token_id":           tid,
+                                    "question":           o["question"],
+                                    "bucket_low":         t_low,
+                                    "bucket_high":        t_high,
+                                    "entry_price":        entry,
+                                    "shares":             round(onchain, 2),
+                                    "cost":               round(onchain * entry, 2),
+                                    "p":                  None,
+                                    "ev":                 None,
+                                    "kelly":              None,
+                                    "forecast_temp":      forecast_temp,
+                                    "forecast_src":       best_source,
+                                    "sigma":              None,
+                                    "opened_at":          snap.get("ts"),
+                                    "status":             "open",
+                                    "pnl":                None,
+                                    "exit_price":         None,
+                                    "close_reason":       None,
+                                    "closed_at":          None,
+                                    "order_id":           None,
+                                    "stop_price":         round(entry * STOP_LOSS_PCT, 4),
+                                    "trailing_activated": False,
+                                    "reconciled":         True,
+                                })
                                 break
                             time.sleep(0.05)
 
             # --- STOP-LOSS, TRAILING STOP, AND TAKE-PROFIT ---
-            if mkt.get("position") and mkt["position"].get("status") == "open":
-                pos = mkt["position"]
+            pos = get_active_cycle(mkt)
+            if pos is not None:
                 current_price = None
                 for o in outcomes:
                     if o["market_id"] == pos["market_id"]:
@@ -960,13 +994,13 @@ def scan_and_update():
                                 pos["pnl"]          = pnl
                                 pos["status"]       = "closed"
                                 closed += 1
-                                print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                                print(f"  [{reason}] {loc['name']} {date} [C{pos['cycle_num']}] | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
                             else:
                                 print(f"  [SELL FAIL] {loc['name']} {date} — will retry next cycle")
 
             # --- CLOSE POSITION if forecast shifted 2+ degrees ---
-            if mkt.get("position") and mkt["position"].get("status") == "open" and forecast_temp is not None:
-                pos = mkt["position"]
+            pos = get_active_cycle(mkt)
+            if pos is not None and forecast_temp is not None:
                 old_bucket_low  = pos["bucket_low"]
                 old_bucket_high = pos["bucket_high"]
                 buffer = 2.0 if unit == "F" else 1.0
@@ -983,24 +1017,31 @@ def scan_and_update():
                         if resp is not None:
                             pnl = round((current_price - pos["entry_price"]) * pos["shares"], 2)
                             balance += pos["cost"] + pnl
-                            mkt["position"]["closed_at"]    = snap.get("ts")
-                            mkt["position"]["close_reason"] = "forecast_changed"
-                            mkt["position"]["exit_price"]   = current_price
-                            mkt["position"]["pnl"]          = pnl
-                            mkt["position"]["status"]       = "closed"
+                            pos["closed_at"]    = snap.get("ts")
+                            pos["close_reason"] = "forecast_changed"
+                            pos["exit_price"]   = current_price
+                            pos["pnl"]          = pnl
+                            pos["status"]       = "closed"
                             closed += 1
-                            print(f"  [CLOSE] {loc['name']} {date} — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                            print(f"  [CLOSE] {loc['name']} {date} [C{pos['cycle_num']}] — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
                         else:
                             print(f"  [SELL FAIL] {loc['name']} {date} — will retry next cycle")
 
             # --- OPEN POSITION (multi-bucket scan) ---
             best_signal = None
-            if not mkt.get("position") and forecast_temp is not None and hours >= MIN_HOURS:
+            _active = get_active_cycle(mkt)
+            _completed = mkt.get("cycles", [])
+            _last_profitable = True  # first entry always allowed
+            if _completed:
+                _last_pnl = _completed[-1].get("pnl")
+                _last_profitable = _last_pnl is not None and _last_pnl > 0
+            if (_active is None and len(_completed) < MAX_CYCLES_PER_MARKET
+                    and _last_profitable and forecast_temp is not None and hours >= MIN_HOURS):
                 sigma = snap.get("best_sigma") or get_sigma(city_slug, best_source or "ecmwf", horizon=i)
 
                 all_open = load_all_markets()
-                total_open = sum(1 for m in all_open if m.get("position") and m["position"].get("status") == "open")
-                date_open = sum(1 for m in all_open if m.get("position") and m["position"].get("status") == "open" and m["date"] == date)
+                total_open = sum(1 for m in all_open if get_active_cycle(m) is not None)
+                date_open = sum(1 for m in all_open if get_active_cycle(m) is not None and m["date"] == date)
 
                 skip_portfolio = False
                 if total_open >= MAX_OPEN_POS:
@@ -1078,13 +1119,16 @@ def scan_and_update():
                             else:
                                 resp = place_buy_order(best_signal["token_id"], best_signal["cost"])
                                 if resp is not None:
-                                    best_signal["order_id"] = resp.get("orderID", resp.get("orderId", ""))
+                                    best_signal["order_id"]           = resp.get("orderID", resp.get("orderId", ""))
+                                    best_signal["cycle_num"]          = len(mkt["cycles"]) + 1
+                                    best_signal["stop_price"]         = round(best_signal["entry_price"] * STOP_LOSS_PCT, 4)
+                                    best_signal["trailing_activated"] = False
                                     balance -= best_signal["cost"]
-                                    mkt["position"] = best_signal
+                                    mkt["cycles"].append(best_signal)
                                     state["total_trades"] += 1
                                     new_pos += 1
                                     bucket_label = f"{best_signal['bucket_low']}-{best_signal['bucket_high']}{unit_sym}"
-                                    print(f"  [BUY]  {loc['name']} {horizon} {date} | {bucket_label} | "
+                                    print(f"  [BUY]  {loc['name']} {horizon} {date} [C{best_signal['cycle_num']}] | {bucket_label} | "
                                           f"${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f} | "
                                           f"${best_signal['cost']:.2f} ({(best_signal['forecast_src'] or 'blend').upper()})")
                                 else:
@@ -1104,8 +1148,8 @@ def scan_and_update():
         if mkt["status"] == "resolved":
             continue
 
-        pos = mkt.get("position")
-        if not pos or pos.get("status") != "open":
+        pos = get_active_cycle(mkt)
+        if pos is None:
             continue
 
         market_id = pos.get("market_id")
@@ -1136,7 +1180,7 @@ def scan_and_update():
         pos["close_reason"] = "resolved"
         pos["closed_at"]    = now.isoformat()
         pos["status"]       = "closed"
-        mkt["pnl"]          = pnl
+        mkt["pnl"]          = round(sum(c.get("pnl") or 0 for c in mkt["cycles"]), 2)
         mkt["status"]       = "resolved"
         mkt["resolved_outcome"] = "win" if won else "loss"
 
@@ -1201,19 +1245,23 @@ _TUNE_MAX_STEP = 0.10
 
 def tune_strategy(markets, state):
     """Adjust strategy parameters based on recent resolved trades."""
-    resolved = sorted(
-        [m for m in markets if m.get("status") == "resolved" and m.get("position")],
-        key=lambda m: m.get("position", {}).get("closed_at", ""),
-    )
-    recent = resolved[-TUNE_LOOKBACK:] if len(resolved) >= 20 else []
-    if not recent:
+    # Flatten all cycles across resolved markets — each cycle is an independent data point
+    resolved_pairs = [
+        (m, c) for m in markets
+        if m.get("status") == "resolved"
+        for c in m.get("cycles", [])
+        if c.get("pnl") is not None
+    ]
+    resolved_pairs.sort(key=lambda x: x[1].get("closed_at", ""))
+    recent_pairs = resolved_pairs[-TUNE_LOOKBACK:] if len(resolved_pairs) >= 20 else []
+    if not recent_pairs:
         return
 
     old = dict(_strategy)
-    positions = [m["position"] for m in recent if m.get("position")]
+    positions = [c for _, c in recent_pairs]
 
-    wins = sum(1 for m in recent if m.get("resolved_outcome") == "win")
-    actual_wr = wins / len(recent) if recent else 0.5
+    wins = sum(1 for _, c in recent_pairs if c.get("close_reason") == "resolved" and (c.get("pnl") or 0) > 0)
+    actual_wr = wins / len(recent_pairs) if recent_pairs else 0.5
     avg_predicted_p = sum(p.get("p", 0.5) for p in positions) / len(positions) if positions else 0.5
 
     if actual_wr > avg_predicted_p + 0.05:
@@ -1224,12 +1272,11 @@ def tune_strategy(markets, state):
         _strategy["kelly_fraction"] = max(_strategy["kelly_fraction"] - adj, _TUNE_BOUNDS["kelly_fraction"][0])
 
     ev_bands = [(0.03, []), (0.05, []), (0.08, []), (0.10, []), (0.15, []), (0.20, [])]
-    for m in recent:
-        pos = m.get("position", {})
-        pos_ev = pos.get("ev", 0)
+    for _, c in recent_pairs:
+        pos_ev = c.get("ev", 0)
         for threshold, group in ev_bands:
             if pos_ev >= threshold:
-                group.append(m.get("pnl", 0) or 0)
+                group.append(c.get("pnl", 0) or 0)
 
     best_ev_threshold = _strategy["min_ev"]
     best_ev_pnl_ratio = 0
@@ -1246,12 +1293,11 @@ def tune_strategy(markets, state):
     _strategy["min_ev"] = round(max(_TUNE_BOUNDS["min_ev"][0], min(_TUNE_BOUNDS["min_ev"][1], current + capped)), 4)
 
     price_bands = [(0.25, []), (0.30, []), (0.35, []), (0.40, []), (0.45, []), (0.55, []), (0.65, [])]
-    for m in recent:
-        pos = m.get("position", {})
-        ep = pos.get("entry_price", 0)
+    for _, c in recent_pairs:
+        ep = c.get("entry_price", 0)
         for ceiling, group in price_bands:
             if ep <= ceiling:
-                group.append(m.get("pnl", 0) or 0)
+                group.append(c.get("pnl", 0) or 0)
 
     best_price_ceil = _strategy["max_price"]
     best_price_pnl = 0
@@ -1286,7 +1332,7 @@ def tune_strategy(markets, state):
 def print_status():
     state    = load_state()
     markets  = load_all_markets()
-    open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
+    open_pos = [m for m in markets if get_active_cycle(m) is not None]
     resolved = [m for m in markets if m["status"] == "resolved" and m.get("pnl") is not None]
 
     bal     = state["balance"]
@@ -1313,9 +1359,9 @@ def print_status():
         print(f"\n  Open positions:")
         total_unrealized = 0.0
         for m in open_pos:
-            pos      = m["position"]
+            pos      = get_active_cycle(m)
             unit_sym = "F" if m["unit"] == "F" else "C"
-            label    = f"{pos['bucket_low']}-{pos['bucket_high']}{unit_sym}"
+            label    = f"{pos['bucket_low']}-{pos['bucket_high']}{unit_sym} [C{pos['cycle_num']}]"
 
             current_price = pos["entry_price"]
             for o in m.get("all_outcomes", []):
@@ -1327,7 +1373,7 @@ def print_status():
             total_unrealized += unrealized
             pnl_str = f"{'+'if unrealized>=0 else ''}{unrealized:.2f}"
 
-            print(f"    {m['city_name']:<16} {m['date']} | {label:<14} | "
+            print(f"    {m['city_name']:<16} {m['date']} | {label:<20} | "
                   f"entry ${pos['entry_price']:.3f} -> ${current_price:.3f} | "
                   f"PnL: {pnl_str} | {(pos.get('forecast_src') or 'blend').upper()}")
 
@@ -1367,17 +1413,23 @@ def print_report():
 
     print(f"\n  Market details:")
     for m in sorted(resolved, key=lambda x: x["date"]):
-        pos      = m.get("position", {})
         unit_sym = "F" if m["unit"] == "F" else "C"
         snaps    = m.get("forecast_snapshots", [])
         first_fc = snaps[0]["best"] if snaps else None
         last_fc  = snaps[-1]["best"] if snaps else None
-        label    = f"{pos.get('bucket_low')}-{pos.get('bucket_high')}{unit_sym}" if pos else "no position"
         result   = m["resolved_outcome"].upper()
-        pnl_str  = f"{'+'if m['pnl']>=0 else ''}{m['pnl']:.2f}" if m["pnl"] is not None else "-"
+        mkt_pnl  = f"{'+'if (m['pnl'] or 0)>=0 else ''}{m['pnl']:.2f}" if m["pnl"] is not None else "-"
         fc_str   = f"forecast {first_fc}->{last_fc}{unit_sym}" if first_fc else "no forecast"
         actual   = f"actual {m['actual_temp']}{unit_sym}" if m["actual_temp"] else ""
-        print(f"    {m['city_name']:<16} {m['date']} | {label:<14} | {fc_str} | {actual} | {result} {pnl_str}")
+        cycles   = m.get("cycles", [])
+        if cycles:
+            for c in cycles:
+                label   = f"{c.get('bucket_low')}-{c.get('bucket_high')}{unit_sym} C{c['cycle_num']}"
+                c_pnl   = f"{'+'if (c.get('pnl') or 0)>=0 else ''}{(c.get('pnl') or 0):.2f}"
+                reason  = c.get("close_reason", "?")
+                print(f"    {m['city_name']:<16} {m['date']} | {label:<18} | {fc_str} | {actual} | {result} {c_pnl} ({reason})")
+        else:
+            print(f"    {m['city_name']:<16} {m['date']} | no cycles       | {fc_str} | {actual} | {result} {mkt_pnl}")
 
     print(f"{'='*55}\n")
 
@@ -1390,40 +1442,61 @@ def print_report():
 def monitor_positions():
     """Quick stop check on open positions without full scan."""
     markets  = load_all_markets()
-    open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
+    open_pos = [m for m in markets if get_active_cycle(m) is not None]
 
-    # Reconcile: check closed positions for orphaned on-chain shares
-    closed_mkts = [m for m in markets if m.get("position") and m["position"].get("status") == "closed"
-                   and m["status"] != "resolved"]
+    # Reconcile: check markets with closed cycles for orphaned on-chain shares
+    closed_mkts = [
+        m for m in markets
+        if m.get("cycles") and get_active_cycle(m) is None and m["status"] != "resolved"
+    ]
     for mkt in closed_mkts:
-        pos = mkt["position"]
-        if not pos.get("token_id"):
+        last_cycle = mkt["cycles"][-1]
+        if not last_cycle.get("token_id"):
             continue
-        onchain = get_token_balance(pos["token_id"])
+        onchain = get_token_balance(last_cycle["token_id"])
         if onchain >= 1.0:
             city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
-            current_price = pos.get("exit_price", pos["entry_price"])
+            current_price = last_cycle.get("exit_price", last_cycle["entry_price"])
             try:
-                r = requests.get(f"https://gamma-api.polymarket.com/markets/{pos['market_id']}", timeout=(3, 5))
+                r = requests.get(f"https://gamma-api.polymarket.com/markets/{last_cycle['market_id']}", timeout=(3, 5))
                 mdata = r.json()
                 prices = json.loads(mdata.get("outcomePrices", "[]"))
                 if prices:
                     current_price = float(prices[0])
             except Exception:
                 pass
-            real_entry = get_real_entry_price(pos["token_id"])
+            real_entry = get_real_entry_price(last_cycle["token_id"])
             entry = real_entry if real_entry is not None else current_price
-            print(f"  [RECONCILE] {city_name} {mkt['date']} — {onchain:.1f} orphaned shares "
+            cycle_num = len(mkt["cycles"]) + 1
+            print(f"  [RECONCILE] {city_name} {mkt['date']} [C{cycle_num}] — {onchain:.1f} orphaned shares "
                   f"(entry ${entry:.4f}, market ${current_price:.3f})")
-            pos["shares"]       = round(onchain, 2)
-            pos["entry_price"]  = entry
-            pos["cost"]         = round(onchain * entry, 2)
-            pos["status"]       = "open"
-            pos["pnl"]          = None
-            pos["exit_price"]   = None
-            pos["close_reason"] = None
-            pos["closed_at"]    = None
-            pos["reconciled"]   = True
+            mkt["cycles"].append({
+                "cycle_num":          cycle_num,
+                "market_id":          last_cycle["market_id"],
+                "token_id":           last_cycle["token_id"],
+                "question":           last_cycle.get("question"),
+                "bucket_low":         last_cycle["bucket_low"],
+                "bucket_high":        last_cycle["bucket_high"],
+                "entry_price":        entry,
+                "shares":             round(onchain, 2),
+                "cost":               round(onchain * entry, 2),
+                "p":                  None,
+                "ev":                 None,
+                "kelly":              None,
+                "forecast_temp":      None,
+                "forecast_src":       None,
+                "sigma":              None,
+                "opened_at":          datetime.now(timezone.utc).isoformat(),
+                "status":             "open",
+                "pnl":                None,
+                "exit_price":         None,
+                "close_reason":       None,
+                "closed_at":          None,
+                "order_id":           None,
+                "stop_price":         round(entry * STOP_LOSS_PCT, 4),
+                "trailing_activated": False,
+                "reconciled":         True,
+            })
             save_market(mkt)
             open_pos.append(mkt)
         time.sleep(0.05)
@@ -1436,7 +1509,9 @@ def monitor_positions():
     closed  = 0
 
     for mkt in open_pos:
-        pos = mkt["position"]
+        pos = get_active_cycle(mkt)
+        if pos is None:
+            continue
         mid = pos["market_id"]
         mutated = False
 
@@ -1518,7 +1593,7 @@ def monitor_positions():
                     pos["status"]       = "closed"
                     closed += 1
                     mutated = True
-                    print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                    print(f"  [{reason}] {city_name} {mkt['date']} [C{pos['cycle_num']}] | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
                 else:
                     print(f"  [SELL FAIL] {city_name} {mkt['date']} — will retry next cycle")
 
