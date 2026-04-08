@@ -40,7 +40,7 @@ from py_clob_client.order_builder.constants import BUY, SELL
 # CONFIG
 # =============================================================================
 
-with open("config.json", encoding="utf-8") as f:
+with open("weather_bot_config.json", encoding="utf-8") as f:
     _cfg = json.load(f)
 
 BALANCE          = _cfg.get("balance", 10000.0)
@@ -58,6 +58,13 @@ TUNE_LOOKBACK    = _cfg.get("tune_lookback", 100)
 TUNE_ENABLED     = _cfg.get("tune_enabled", True)
 MAX_OPEN_POS     = _cfg.get("max_open_positions", 15)
 MAX_POS_PER_DATE = _cfg.get("max_positions_per_date", 6)
+MONITOR_INTERVAL = _cfg.get("monitor_interval", 600)
+STOP_LOSS_PCT    = _cfg.get("stop_loss_pct", 0.80)
+TAKE_PROFIT_SHORT= _cfg.get("take_profit_short", 0.85)  # 24-48h remaining
+TAKE_PROFIT_LONG = _cfg.get("take_profit_long", 0.75)   # >48h remaining
+TAKE_PROFIT_FINAL= _cfg.get("take_profit_final", 0.50)  # <24h remaining
+TAKE_PROFIT_ROI  = _cfg.get("take_profit_roi", 0.40)    # sell when price >= entry * (1 + ROI)
+SCAN_REGIONS     = set(_cfg.get("scan_regions", ["eu"]))
 
 # CLOB credentials
 POLYMARKET_HOST    = "https://clob.polymarket.com"
@@ -198,9 +205,11 @@ def place_buy_order(token_id: str, cost: float) -> dict | None:
             print(f"  [BUY ERROR] {order_type}: {e}")
     return None
 
-def place_sell_order(token_id: str, size: float, price: float) -> dict | None:
+def place_sell_order(token_id: str, size: float, price: float, market_id: str = None) -> dict | None:
     """
-    Place a limit FAK SELL order for `size` shares at `price`.
+    Place a limit FAK SELL order for `size` shares.
+    Uses best bid from Polymarket for pricing to ensure fills.
+    Falls back to `price` if best bid unavailable.
     Queries actual conditional token balance first and caps size to what's
     available, preventing "not enough balance" errors from partial fills.
     Returns the response dict on success, None on failure.
@@ -224,19 +233,85 @@ def place_sell_order(token_id: str, size: float, price: float) -> dict | None:
     except Exception as e:
         print(f"  [SELL] Could not check token balance: {e} — using recorded size")
 
+    # Fetch best bid for realistic sell pricing
+    sell_price = price
+    if market_id:
+        try:
+            r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(3, 5))
+            mdata = r.json()
+            best_bid = mdata.get("bestBid")
+            if best_bid is not None:
+                sell_price = float(best_bid)
+                if sell_price != price:
+                    print(f"  [SELL] Using best bid ${sell_price:.3f} (market ${price:.3f})")
+        except Exception:
+            pass
+
+    if sell_price <= 0.005:
+        print(f"  [SELL] Bid too low (${sell_price:.3f}), skipping")
+        return None
+
     try:
         sell_args = OrderArgs(
             token_id=token_id,
-            price=round(price, 4),
+            price=round(sell_price, 4),
             size=actual_size,
             side=SELL,
         )
         signed = client.create_order(sell_args)
         resp = client.post_order(signed, OrderType.FAK)
+        if not resp or resp.get("status") not in ("matched", "delayed"):
+            status = resp.get("status", "unknown") if resp else "no response"
+            print(f"  [SELL] Order not filled (status: {status})")
+            return None
         return resp
     except Exception as e:
         print(f"  [SELL ERROR] {e}")
         return None
+
+def get_token_balance(token_id: str) -> float:
+    """Query on-chain conditional token balance (in shares)."""
+    if not token_id:
+        return 0.0
+    try:
+        client = get_clob_client()
+        bal_resp = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+        )
+        return float(bal_resp["balance"]) / 1e6
+    except Exception as e:
+        print(f"  [BALANCE] Error checking token balance: {e}")
+        return 0.0
+
+def get_real_entry_price(token_id: str) -> float | None:
+    """Query Polymarket trade history to find actual average buy price."""
+    try:
+        client = get_clob_client()
+        try:
+            from py_clob_client.clob_types import TradeParams
+            trades = client.get_trades(TradeParams(asset_id=token_id))
+        except (ImportError, TypeError, AttributeError):
+            trades = client.get_trades({"asset_id": token_id})
+
+        if not trades:
+            return None
+
+        total_cost = 0.0
+        total_shares = 0.0
+        for t in trades:
+            side = (t.get("side") or "").upper()
+            if side == "BUY":
+                price = float(t.get("price", 0))
+                size = float(t.get("size", 0))
+                if price > 0 and size > 0:
+                    total_cost += price * size
+                    total_shares += size
+
+        if total_shares > 0:
+            return round(total_cost / total_shares, 6)
+    except Exception as e:
+        print(f"  [TRADES] Could not fetch trade history: {e}")
+    return None
 
 # =============================================================================
 # MATH
@@ -303,6 +378,8 @@ def run_calibration(markets):
 
     for source in ["ecmwf", "hrrr"]:
         for city in set(m["city"] for m in resolved):
+            if city not in LOCATIONS:
+                continue
             group = [m for m in resolved if m["city"] == city]
             prior_sigma = SIGMA_F if LOCATIONS[city]["unit"] == "F" else SIGMA_C
 
@@ -667,6 +744,8 @@ def scan_and_update():
     resolved = 0
 
     for city_slug, loc in LOCATIONS.items():
+        if loc.get("region") not in SCAN_REGIONS:
+            continue
         unit = loc["unit"]
         unit_sym = "F" if unit == "F" else "C"
         print(f"  -> {loc['name']}...", end=" ", flush=True)
@@ -757,6 +836,69 @@ def scan_and_update():
             forecast_temp = snap.get("best")
             best_source   = snap.get("best_source")
 
+            # --- RECONCILE: detect on-chain positions not tracked locally ---
+            if mkt["status"] != "resolved":
+                pos = mkt.get("position")
+                need_reconcile = pos is None or pos.get("status") != "open"
+                if need_reconcile and outcomes:
+                    if pos is not None and pos.get("token_id"):
+                        onchain = get_token_balance(pos["token_id"])
+                        if onchain >= 1.0:
+                            matching = next((o for o in outcomes if o.get("token_id") == pos["token_id"]), None)
+                            cp = matching["price"] if matching else pos.get("exit_price", pos["entry_price"])
+                            real_entry = get_real_entry_price(pos["token_id"])
+                            entry = real_entry if real_entry is not None else cp
+                            print(f"  [RECONCILE] {loc['name']} {date} — {onchain:.1f} orphaned shares on-chain "
+                                  f"(entry ${entry:.4f}, market ${cp:.3f})")
+                            pos["shares"]       = round(onchain, 2)
+                            pos["entry_price"]  = entry
+                            pos["cost"]         = round(onchain * entry, 2)
+                            pos["status"]       = "open"
+                            pos["pnl"]          = None
+                            pos["exit_price"]   = None
+                            pos["close_reason"] = None
+                            pos["closed_at"]    = None
+                            pos["reconciled"]   = True
+                    else:
+                        for o in outcomes:
+                            tid = o.get("token_id")
+                            if not tid:
+                                continue
+                            onchain = get_token_balance(tid)
+                            if onchain >= 1.0:
+                                cp = o["price"]
+                                t_low, t_high = o["range"]
+                                real_entry = get_real_entry_price(tid)
+                                entry = real_entry if real_entry is not None else cp
+                                print(f"  [RECONCILE] {loc['name']} {date} — {onchain:.1f} on-chain shares "
+                                      f"({t_low}-{t_high}{unit_sym}) entry ${entry:.4f}, market ${cp:.3f}")
+                                mkt["position"] = {
+                                    "market_id":    o["market_id"],
+                                    "token_id":     tid,
+                                    "question":     o["question"],
+                                    "bucket_low":   t_low,
+                                    "bucket_high":  t_high,
+                                    "entry_price":  entry,
+                                    "shares":       round(onchain, 2),
+                                    "cost":         round(onchain * entry, 2),
+                                    "p":            None,
+                                    "ev":           None,
+                                    "kelly":        None,
+                                    "forecast_temp": forecast_temp,
+                                    "forecast_src":  best_source,
+                                    "sigma":        None,
+                                    "opened_at":    snap.get("ts"),
+                                    "status":       "open",
+                                    "pnl":          None,
+                                    "exit_price":   None,
+                                    "close_reason": None,
+                                    "closed_at":    None,
+                                    "order_id":     None,
+                                    "reconciled":   True,
+                                }
+                                break
+                            time.sleep(0.05)
+
             # --- STOP-LOSS, TRAILING STOP, AND TAKE-PROFIT ---
             if mkt.get("position") and mkt["position"].get("status") == "open":
                 pos = mkt["position"]
@@ -768,29 +910,33 @@ def scan_and_update():
 
                 if current_price is not None:
                     entry = pos["entry_price"]
-                    stop  = pos.get("stop_price", entry * 0.80)
+                    stop  = pos.get("stop_price", entry * STOP_LOSS_PCT)
 
                     if current_price >= entry * 1.20 and stop < entry:
                         pos["stop_price"] = entry
                         pos["trailing_activated"] = True
 
                     if hours < 24:
-                        take_profit = None
+                        take_profit = TAKE_PROFIT_FINAL
                     elif hours < 48:
-                        take_profit = 0.85
+                        take_profit = TAKE_PROFIT_SHORT
                     else:
-                        take_profit = 0.75
+                        take_profit = TAKE_PROFIT_LONG
 
-                    take_triggered = take_profit is not None and current_price >= take_profit
+                    roi_threshold = entry * (1.0 + TAKE_PROFIT_ROI)
+                    take_triggered = current_price >= take_profit or current_price >= roi_threshold
                     stop_triggered = current_price <= stop
 
                     if take_triggered or stop_triggered:
-                        resp = place_sell_order(pos["token_id"], pos["shares"], current_price)
+                        resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
                         if resp is not None:
                             pnl = round((current_price - entry) * pos["shares"], 2)
                             balance += pos["cost"] + pnl
                             pos["closed_at"]    = snap.get("ts")
-                            if take_triggered:
+                            if current_price >= roi_threshold and current_price < take_profit:
+                                pos["close_reason"] = "take_profit_roi"
+                                reason = "TAKE ROI"
+                            elif take_triggered:
                                 pos["close_reason"] = "take_profit"
                                 reason = "TAKE"
                             elif current_price < entry:
@@ -822,7 +968,7 @@ def scan_and_update():
                             current_price = o["price"]
                             break
                     if current_price is not None:
-                        resp = place_sell_order(pos["token_id"], pos["shares"], current_price)
+                        resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
                         if resp is not None:
                             pnl = round((current_price - pos["entry_price"]) * pos["shares"], 2)
                             balance += pos["cost"] + pnl
@@ -915,19 +1061,23 @@ def scan_and_update():
                         if not best_signal["token_id"]:
                             print(f"  [SKIP] {loc['name']} {date} — no token_id, cannot place order")
                         else:
-                            resp = place_buy_order(best_signal["token_id"], best_signal["cost"])
-                            if resp is not None:
-                                best_signal["order_id"] = resp.get("orderID", resp.get("orderId", ""))
-                                balance -= best_signal["cost"]
-                                mkt["position"] = best_signal
-                                state["total_trades"] += 1
-                                new_pos += 1
-                                bucket_label = f"{best_signal['bucket_low']}-{best_signal['bucket_high']}{unit_sym}"
-                                print(f"  [BUY]  {loc['name']} {horizon} {date} | {bucket_label} | "
-                                      f"${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f} | "
-                                      f"${best_signal['cost']:.2f} ({(best_signal['forecast_src'] or 'blend').upper()})")
+                            existing = get_token_balance(best_signal["token_id"])
+                            if existing >= 1.0:
+                                print(f"  [SKIP] {loc['name']} {date} — already hold {existing:.1f} shares on-chain")
                             else:
-                                print(f"  [ORDER FAIL] {loc['name']} {date} — order not filled")
+                                resp = place_buy_order(best_signal["token_id"], best_signal["cost"])
+                                if resp is not None:
+                                    best_signal["order_id"] = resp.get("orderID", resp.get("orderId", ""))
+                                    balance -= best_signal["cost"]
+                                    mkt["position"] = best_signal
+                                    state["total_trades"] += 1
+                                    new_pos += 1
+                                    bucket_label = f"{best_signal['bucket_low']}-{best_signal['bucket_high']}{unit_sym}"
+                                    print(f"  [BUY]  {loc['name']} {horizon} {date} | {bucket_label} | "
+                                          f"${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f} | "
+                                          f"${best_signal['cost']:.2f} ({(best_signal['forecast_src'] or 'blend').upper()})")
+                                else:
+                                    print(f"  [ORDER FAIL] {loc['name']} {date} — order not filled")
 
             # Market closed by time
             if hours < 0.5 and mkt["status"] == "open":
@@ -1005,7 +1155,7 @@ def scan_and_update():
                 market_date = datetime.strptime(mkt["date"], "%Y-%m-%d").date()
             except Exception:
                 continue
-            if market_date < now.date():
+            if market_date < now.date() and mkt["city"] in LOCATIONS:
                 actual = get_actual_temp(mkt["city"], mkt["date"])
                 if actual is not None:
                     mkt["actual_temp"] = actual
@@ -1032,7 +1182,7 @@ def scan_and_update():
 # =============================================================================
 
 _TUNE_BOUNDS = {
-    "kelly_fraction": (0.10, 0.50),
+    "kelly_fraction": (0.10, 0.60),
     "min_ev":         (0.03, 0.30),
     "max_price":      (0.25, 0.65),
 }
@@ -1224,12 +1374,49 @@ def print_report():
 # MAIN LOOP
 # =============================================================================
 
-MONITOR_INTERVAL = 600  # monitor positions every 10 minutes
+# MONITOR_INTERVAL is now read from config above
 
 def monitor_positions():
     """Quick stop check on open positions without full scan."""
     markets  = load_all_markets()
     open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
+
+    # Reconcile: check closed positions for orphaned on-chain shares
+    closed_mkts = [m for m in markets if m.get("position") and m["position"].get("status") == "closed"
+                   and m["status"] != "resolved"]
+    for mkt in closed_mkts:
+        pos = mkt["position"]
+        if not pos.get("token_id"):
+            continue
+        onchain = get_token_balance(pos["token_id"])
+        if onchain >= 1.0:
+            city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
+            current_price = pos.get("exit_price", pos["entry_price"])
+            try:
+                r = requests.get(f"https://gamma-api.polymarket.com/markets/{pos['market_id']}", timeout=(3, 5))
+                mdata = r.json()
+                prices = json.loads(mdata.get("outcomePrices", "[]"))
+                if prices:
+                    current_price = float(prices[0])
+            except Exception:
+                pass
+            real_entry = get_real_entry_price(pos["token_id"])
+            entry = real_entry if real_entry is not None else current_price
+            print(f"  [RECONCILE] {city_name} {mkt['date']} — {onchain:.1f} orphaned shares "
+                  f"(entry ${entry:.4f}, market ${current_price:.3f})")
+            pos["shares"]       = round(onchain, 2)
+            pos["entry_price"]  = entry
+            pos["cost"]         = round(onchain * entry, 2)
+            pos["status"]       = "open"
+            pos["pnl"]          = None
+            pos["exit_price"]   = None
+            pos["close_reason"] = None
+            pos["closed_at"]    = None
+            pos["reconciled"]   = True
+            save_market(mkt)
+            open_pos.append(mkt)
+        time.sleep(0.05)
+
     if not open_pos:
         return 0
 
@@ -1262,18 +1449,18 @@ def monitor_positions():
             continue
 
         entry = pos["entry_price"]
-        stop  = pos.get("stop_price", entry * 0.80)
+        stop  = pos.get("stop_price", entry * STOP_LOSS_PCT)
         city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
 
         end_date = mkt.get("event_end_date", "")
         hours_left = hours_to_resolution(end_date) if end_date else 999.0
 
         if hours_left < 24:
-            take_profit = None
+            take_profit = TAKE_PROFIT_FINAL
         elif hours_left < 48:
-            take_profit = 0.85
+            take_profit = TAKE_PROFIT_SHORT
         else:
-            take_profit = 0.75
+            take_profit = TAKE_PROFIT_LONG
 
         if current_price >= entry * 1.20 and stop < entry:
             pos["stop_price"] = entry
@@ -1281,16 +1468,20 @@ def monitor_positions():
             mutated = True
             print(f"  [TRAILING] {city_name} {mkt['date']} — stop moved to breakeven ${entry:.3f}")
 
-        take_triggered = take_profit is not None and current_price >= take_profit
+        roi_threshold = entry * (1.0 + TAKE_PROFIT_ROI)
+        take_triggered = current_price >= take_profit or current_price >= roi_threshold
         stop_triggered = current_price <= stop
 
         if take_triggered or stop_triggered:
-            resp = place_sell_order(pos["token_id"], pos["shares"], current_price)
+            resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
             if resp is not None:
                 pnl = round((current_price - entry) * pos["shares"], 2)
                 balance += pos["cost"] + pnl
                 pos["closed_at"] = datetime.now(timezone.utc).isoformat()
-                if take_triggered:
+                if current_price >= roi_threshold and current_price < take_profit:
+                    pos["close_reason"] = "take_profit_roi"
+                    reason = "TAKE ROI"
+                elif take_triggered:
                     pos["close_reason"] = "take_profit"
                     reason = "TAKE"
                 elif current_price < entry:
