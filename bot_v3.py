@@ -928,30 +928,41 @@ def scan_and_update():
                     stop_triggered = current_price <= stop
 
                     if take_triggered or stop_triggered:
-                        resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
-                        if resp is not None:
+                        onchain = get_token_balance(pos["token_id"])
+                        if onchain < 1.0:
                             pnl = round((current_price - entry) * pos["shares"], 2)
-                            balance += pos["cost"] + pnl
-                            pos["closed_at"]    = snap.get("ts")
-                            if current_price >= roi_threshold and current_price < take_profit:
-                                pos["close_reason"] = "take_profit_roi"
-                                reason = "TAKE ROI"
-                            elif take_triggered:
-                                pos["close_reason"] = "take_profit"
-                                reason = "TAKE"
-                            elif current_price < entry:
-                                pos["close_reason"] = "stop_loss"
-                                reason = "STOP"
-                            else:
-                                pos["close_reason"] = "trailing_stop"
-                                reason = "TRAILING BE"
                             pos["exit_price"]   = current_price
                             pos["pnl"]          = pnl
                             pos["status"]       = "closed"
+                            pos["close_reason"] = "sold_externally"
+                            pos["closed_at"]    = snap.get("ts")
                             closed += 1
-                            print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                            print(f"  [CLOSED] {loc['name']} {date} — 0 shares on-chain, position already sold/resolved")
                         else:
-                            print(f"  [SELL FAIL] {loc['name']} {date} — will retry next cycle")
+                            resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
+                            if resp is not None:
+                                pnl = round((current_price - entry) * pos["shares"], 2)
+                                balance += pos["cost"] + pnl
+                                pos["closed_at"]    = snap.get("ts")
+                                if current_price >= roi_threshold and current_price < take_profit:
+                                    pos["close_reason"] = "take_profit_roi"
+                                    reason = "TAKE ROI"
+                                elif take_triggered:
+                                    pos["close_reason"] = "take_profit"
+                                    reason = "TAKE"
+                                elif current_price < entry:
+                                    pos["close_reason"] = "stop_loss"
+                                    reason = "STOP"
+                                else:
+                                    pos["close_reason"] = "trailing_stop"
+                                    reason = "TRAILING BE"
+                                pos["exit_price"]   = current_price
+                                pos["pnl"]          = pnl
+                                pos["status"]       = "closed"
+                                closed += 1
+                                print(f"  [{reason}] {loc['name']} {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                            else:
+                                print(f"  [SELL FAIL] {loc['name']} {date} — will retry next cycle")
 
             # --- CLOSE POSITION if forecast shifted 2+ degrees ---
             if mkt.get("position") and mkt["position"].get("status") == "open" and forecast_temp is not None:
@@ -1473,31 +1484,43 @@ def monitor_positions():
         stop_triggered = current_price <= stop
 
         if take_triggered or stop_triggered:
-            resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
-            if resp is not None:
+            onchain = get_token_balance(pos["token_id"])
+            if onchain < 1.0:
                 pnl = round((current_price - entry) * pos["shares"], 2)
-                balance += pos["cost"] + pnl
-                pos["closed_at"] = datetime.now(timezone.utc).isoformat()
-                if current_price >= roi_threshold and current_price < take_profit:
-                    pos["close_reason"] = "take_profit_roi"
-                    reason = "TAKE ROI"
-                elif take_triggered:
-                    pos["close_reason"] = "take_profit"
-                    reason = "TAKE"
-                elif current_price < entry:
-                    pos["close_reason"] = "stop_loss"
-                    reason = "STOP"
-                else:
-                    pos["close_reason"] = "trailing_stop"
-                    reason = "TRAILING BE"
                 pos["exit_price"]   = current_price
                 pos["pnl"]          = pnl
                 pos["status"]       = "closed"
+                pos["close_reason"] = "sold_externally"
+                pos["closed_at"]    = datetime.now(timezone.utc).isoformat()
                 closed += 1
                 mutated = True
-                print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                print(f"  [CLOSED] {city_name} {mkt['date']} — 0 shares on-chain, position already sold/resolved")
             else:
-                print(f"  [SELL FAIL] {city_name} {mkt['date']} — will retry next cycle")
+                resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
+                if resp is not None:
+                    pnl = round((current_price - entry) * pos["shares"], 2)
+                    balance += pos["cost"] + pnl
+                    pos["closed_at"] = datetime.now(timezone.utc).isoformat()
+                    if current_price >= roi_threshold and current_price < take_profit:
+                        pos["close_reason"] = "take_profit_roi"
+                        reason = "TAKE ROI"
+                    elif take_triggered:
+                        pos["close_reason"] = "take_profit"
+                        reason = "TAKE"
+                    elif current_price < entry:
+                        pos["close_reason"] = "stop_loss"
+                        reason = "STOP"
+                    else:
+                        pos["close_reason"] = "trailing_stop"
+                        reason = "TRAILING BE"
+                    pos["exit_price"]   = current_price
+                    pos["pnl"]          = pnl
+                    pos["status"]       = "closed"
+                    closed += 1
+                    mutated = True
+                    print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                else:
+                    print(f"  [SELL FAIL] {city_name} {mkt['date']} — will retry next cycle")
 
         if mutated:
             save_market(mkt)

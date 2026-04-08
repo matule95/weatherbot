@@ -156,6 +156,12 @@ ENTRY_MAX_SEC  = _cfg.get("btc_entry_window_max_sec", 660)
 SCAN_INTERVAL  = 60
 TUNE_LOOKBACK  = _cv("tune_lookback",  _cfg.get("btc_tune_lookback", 30))
 PRIOR_WEIGHT   = _cv("prior_weight",   _cfg.get("btc_prior_weight", 10))
+MONITOR_INTERVAL = _cfg.get("monitor_interval", 15)
+STOP_LOSS_PCT    = _cfg.get("stop_loss_pct", 0.80)
+TAKE_PROFIT_SHORT= _cfg.get("take_profit_short", 0.85)
+TAKE_PROFIT_LONG = _cfg.get("take_profit_long", 0.75)
+TAKE_PROFIT_FINAL= _cfg.get("take_profit_final", 0.50)
+TAKE_PROFIT_ROI  = _cfg.get("take_profit_roi", 0.40)
 
 # Data dirs — one per coin
 DATA_DIR         = Path(f"data_{COIN.lower()}")
@@ -261,6 +267,52 @@ def get_real_balance() -> float | None:
         return None
 
 
+def get_token_balance(token_id: str) -> float:
+    """Query on-chain conditional token balance (in shares)."""
+    if not token_id:
+        return 0.0
+    try:
+        client = get_clob_client()
+        bal_resp = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+        )
+        return float(bal_resp["balance"]) / 1e6
+    except Exception as e:
+        print(f"  [BALANCE] Error checking token balance: {e}")
+        return 0.0
+
+
+def get_real_entry_price(token_id: str) -> float | None:
+    """Query Polymarket trade history to find actual average buy price."""
+    try:
+        client = get_clob_client()
+        try:
+            from py_clob_client.clob_types import TradeParams
+            trades = client.get_trades(TradeParams(asset_id=token_id))
+        except (ImportError, TypeError, AttributeError):
+            trades = client.get_trades({"asset_id": token_id})
+
+        if not trades:
+            return None
+
+        total_cost = 0.0
+        total_shares = 0.0
+        for t in trades:
+            side = (t.get("side") or "").upper()
+            if side == "BUY":
+                price = float(t.get("price", 0))
+                size = float(t.get("size", 0))
+                if price > 0 and size > 0:
+                    total_cost += price * size
+                    total_shares += size
+
+        if total_shares > 0:
+            return round(total_cost / total_shares, 6)
+    except Exception as e:
+        print(f"  [TRADES] Could not fetch trade history: {e}")
+    return None
+
+
 def place_buy_order(token_id: str, cost: float) -> dict | None:
     client = get_clob_client()
     mo = MarketOrderArgs(token_id=token_id, amount=cost, side=BUY)
@@ -275,8 +327,14 @@ def place_buy_order(token_id: str, cost: float) -> dict | None:
     return None
 
 
-def place_sell_order(token_id: str, size: float, price: float) -> dict | None:
+def place_sell_order(token_id: str, size: float, price: float, market_id: str = None) -> dict | None:
+    """
+    Place a limit FAK SELL order for `size` shares.
+    Uses best bid from Polymarket for pricing to ensure fills.
+    Falls back to `price` if best bid unavailable.
+    """
     client = get_clob_client()
+
     actual_size = round(size, 2)
     try:
         bal_resp = client.get_balance_allowance(
@@ -284,18 +342,44 @@ def place_sell_order(token_id: str, size: float, price: float) -> dict | None:
         )
         available = float(bal_resp["balance"]) / 1e6
         if available < 1.0:
+            print(f"  [SELL] Token balance too low ({available:.2f} shares), skipping")
             return None
         if available < actual_size:
-            actual_size = math.floor(available * 100) / 100
-    except Exception:
-        pass
+            floored = math.floor(available * 100) / 100
+            print(f"  [SELL] Capping size {actual_size:.2f} → {floored:.2f} (partial fill on buy)")
+            actual_size = floored
+    except Exception as e:
+        print(f"  [SELL] Could not check token balance: {e} — using recorded size")
+
+    sell_price = price
+    if market_id:
+        try:
+            r = requests.get(f"{GAMMA_API}/markets/{market_id}", timeout=(3, 5))
+            mdata = r.json()
+            best_bid = mdata.get("bestBid")
+            if best_bid is not None:
+                sell_price = float(best_bid)
+                if sell_price != price:
+                    print(f"  [SELL] Using best bid ${sell_price:.3f} (market ${price:.3f})")
+        except Exception:
+            pass
+
+    if sell_price <= 0.005:
+        print(f"  [SELL] Bid too low (${sell_price:.3f}), skipping")
+        return None
+
     try:
         sell_args = OrderArgs(
-            token_id=token_id, price=round(price, 4),
+            token_id=token_id, price=round(sell_price, 4),
             size=actual_size, side=SELL,
         )
         signed = client.create_order(sell_args)
-        return client.post_order(signed, OrderType.FAK)
+        resp = client.post_order(signed, OrderType.FAK)
+        if not resp or resp.get("status") not in ("matched", "delayed"):
+            status = resp.get("status", "unknown") if resp else "no response"
+            print(f"  [SELL] Order not filled (status: {status})")
+            return None
+        return resp
     except Exception as e:
         print(f"  [SELL ERROR] {e}")
         return None
@@ -913,9 +997,97 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
         })
         save_market(mdata)
 
-        # --- Skip conditions ---
-        if slug in open_slugs or (mdata["position"] and mdata["position"].get("status") == "open"):
+        # --- RECONCILE: detect on-chain positions not tracked locally ---
+        pos = mdata.get("position")
+        need_reconcile = pos is None or pos.get("status") != "open"
+        if need_reconcile:
+            token_ids_to_check = []
+            if pos is not None and pos.get("token_id"):
+                token_ids_to_check = [(pos["token_id"], pos.get("bet_side", "?"))]
+            else:
+                token_ids_to_check = [
+                    (mkt["up_token_id"], "Up"),
+                    (mkt["down_token_id"], "Down"),
+                ]
+            for tid, side in token_ids_to_check:
+                if not tid:
+                    continue
+                onchain = get_token_balance(tid)
+                if onchain >= 1.0:
+                    real_entry = get_real_entry_price(tid)
+                    cp = mkt["up_price"] if side == "Up" else mkt["down_price"]
+                    entry = real_entry if real_entry is not None else cp
+                    print(f"  [RECONCILE] {slug} — {onchain:.1f} orphaned shares ({side}) "
+                          f"entry ${entry:.4f}, market ${cp:.3f}")
+                    mdata["position"] = {
+                        "bet_side":     side,
+                        "token_id":     tid,
+                        "market_id":    mkt["market_id"],
+                        "entry_price":  entry,
+                        "shares":       round(onchain, 2),
+                        "cost":         round(onchain * entry, 2),
+                        "status":       "open",
+                        "outcome":      None,
+                        "pnl":          None,
+                        "reconciled":   True,
+                    }
+                    save_market(mdata)
+                    break
+                time.sleep(0.05)
+
+        # --- STOP-LOSS, TRAILING STOP, AND TAKE-PROFIT for open positions ---
+        if mdata.get("position") and mdata["position"].get("status") == "open":
+            pos = mdata["position"]
+            tid = pos.get("token_id") or (mkt["up_token_id"] if pos["bet_side"] == "Up" else mkt["down_token_id"])
+            cp = mkt["up_price"] if pos["bet_side"] == "Up" else mkt["down_price"]
+
+            if cp is not None:
+                entry = pos["entry_price"]
+                stop  = pos.get("stop_price", entry * STOP_LOSS_PCT)
+
+                if cp >= entry * 1.20 and stop < entry:
+                    pos["stop_price"] = entry
+                    pos["trailing_activated"] = True
+
+                minutes_left = seconds_to_end / 60.0
+                if minutes_left < 5:
+                    take_profit = TAKE_PROFIT_FINAL
+                else:
+                    take_profit = TAKE_PROFIT_SHORT
+
+                roi_threshold = entry * (1.0 + TAKE_PROFIT_ROI)
+                take_triggered = cp >= take_profit or cp >= roi_threshold
+                stop_triggered = cp <= stop
+
+                if take_triggered or stop_triggered:
+                    mid = pos.get("market_id", mkt["market_id"])
+                    resp = place_sell_order(tid, pos["shares"], cp, market_id=mid)
+                    if resp is not None:
+                        pnl = round((cp - entry) * pos["shares"], 2)
+                        if cp >= roi_threshold and cp < take_profit:
+                            pos["close_reason"] = "take_profit_roi"
+                            reason = "TAKE ROI"
+                        elif take_triggered:
+                            pos["close_reason"] = "take_profit"
+                            reason = "TAKE"
+                        elif cp < entry:
+                            pos["close_reason"] = "stop_loss"
+                            reason = "STOP"
+                        else:
+                            pos["close_reason"] = "trailing_stop"
+                            reason = "TRAILING BE"
+                        pos["exit_price"] = cp
+                        pos["pnl"]        = pnl
+                        pos["status"]     = "closed"
+                        pos["closed_at"]  = now.isoformat()
+                        save_market(mdata)
+                        print(f"  [{reason}] {slug} | entry ${entry:.3f} exit ${cp:.3f} | "
+                              f"{minutes_left:.0f}m left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                    else:
+                        print(f"  [SELL FAIL] {slug} — will retry next cycle")
             continue
+
+        # --- Skip conditions for new entries ---
         if not (ENTRY_MIN_SEC <= seconds_to_end <= ENTRY_MAX_SEC):
             continue
         if mdata["coin_start_price"] is None:
@@ -979,8 +1151,15 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
             print("        [DRY-RUN] Order NOT placed.")
             continue
 
+        existing = get_token_balance(token_id)
+        if existing >= 1.0:
+            print(f"  [SKIP] {slug} — already hold {existing:.1f} shares on-chain")
+            continue
+
         position = {
             "bet_side":              bet_side,
+            "token_id":             token_id,
+            "market_id":            mkt["market_id"],
             "entry_price":           entry_price,
             "shares":                shares_est,
             "cost":                  cost,
@@ -1020,6 +1199,141 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
         print(f"        [OK] OrderID={position['order_id']}")
 
     return state
+
+
+# =============================================================================
+# MONITOR POSITIONS  (between full scans)
+# =============================================================================
+
+def monitor_positions() -> int:
+    """Quick stop-loss / take-profit check on open positions without full scan."""
+    now = datetime.now(timezone.utc)
+    markets = load_all_markets()
+    open_pos = [m for m in markets if m.get("position") and m["position"].get("status") == "open"]
+
+    closed_mkts = [m for m in markets if m.get("position") and m["position"].get("status") == "closed"
+                   and m.get("position", {}).get("outcome") is None]
+    for mkt in closed_mkts:
+        pos = mkt["position"]
+        tid = pos.get("token_id")
+        if not tid:
+            continue
+        onchain = get_token_balance(tid)
+        if onchain >= 1.0:
+            try:
+                r = requests.get(f"{GAMMA_API}/markets/{pos.get('market_id', '')}", timeout=(3, 5))
+                mdata = r.json()
+                prices_raw = _parse_json_field(mdata.get("outcomePrices"), ["0.5", "0.5"])
+                cp = float(prices_raw[0]) if pos.get("bet_side") == "Up" else float(prices_raw[1])
+            except Exception:
+                cp = pos.get("exit_price", pos["entry_price"])
+            real_entry = get_real_entry_price(tid)
+            entry = real_entry if real_entry is not None else cp
+            print(f"  [RECONCILE] {mkt['slug']} — {onchain:.1f} orphaned shares "
+                  f"(entry ${entry:.4f}, market ${cp:.3f})")
+            pos["shares"]       = round(onchain, 2)
+            pos["entry_price"]  = entry
+            pos["cost"]         = round(onchain * entry, 2)
+            pos["status"]       = "open"
+            pos["pnl"]          = None
+            pos["exit_price"]   = None
+            pos["close_reason"] = None
+            pos["closed_at"]    = None
+            pos["reconciled"]   = True
+            save_market(mkt)
+            open_pos.append(mkt)
+        time.sleep(0.05)
+
+    if not open_pos:
+        return 0
+
+    state   = load_state()
+    balance = state["balance"]
+    closed  = 0
+
+    for mkt in open_pos:
+        pos = mkt["position"]
+        mid = pos.get("market_id", "")
+        mutated = False
+
+        current_price = None
+        try:
+            r = requests.get(f"{GAMMA_API}/markets/{mid}", timeout=(3, 5))
+            mdata = r.json()
+            best_bid = mdata.get("bestBid")
+            if best_bid is not None:
+                current_price = float(best_bid)
+        except Exception:
+            pass
+
+        if current_price is None:
+            continue
+
+        entry = pos["entry_price"]
+        stop  = pos.get("stop_price", entry * STOP_LOSS_PCT)
+
+        try:
+            end_dt = datetime.fromisoformat(mkt["event_end"].replace("Z", "+00:00"))
+            seconds_left = max(0, (end_dt - now).total_seconds())
+        except Exception:
+            seconds_left = 900.0
+        minutes_left = seconds_left / 60.0
+
+        if current_price >= entry * 1.20 and stop < entry:
+            pos["stop_price"] = entry
+            pos["trailing_activated"] = True
+            mutated = True
+            print(f"  [TRAILING] {mkt['slug']} — stop moved to breakeven ${entry:.3f}")
+
+        if minutes_left < 5:
+            take_profit = TAKE_PROFIT_FINAL
+        else:
+            take_profit = TAKE_PROFIT_SHORT
+
+        roi_threshold = entry * (1.0 + TAKE_PROFIT_ROI)
+        take_triggered = current_price >= take_profit or current_price >= roi_threshold
+        stop_triggered = current_price <= stop
+
+        if take_triggered or stop_triggered:
+            tid = pos.get("token_id")
+            if not tid:
+                tid = mkt.get("up_token_id") if pos["bet_side"] == "Up" else mkt.get("down_token_id")
+            resp = place_sell_order(tid, pos["shares"], current_price, market_id=mid)
+            if resp is not None:
+                pnl = round((current_price - entry) * pos["shares"], 2)
+                balance += pos["cost"] + pnl
+                pos["closed_at"] = now.isoformat()
+                if current_price >= roi_threshold and current_price < take_profit:
+                    pos["close_reason"] = "take_profit_roi"
+                    reason = "TAKE ROI"
+                elif take_triggered:
+                    pos["close_reason"] = "take_profit"
+                    reason = "TAKE"
+                elif current_price < entry:
+                    pos["close_reason"] = "stop_loss"
+                    reason = "STOP"
+                else:
+                    pos["close_reason"] = "trailing_stop"
+                    reason = "TRAILING BE"
+                pos["exit_price"] = current_price
+                pos["pnl"]        = pnl
+                pos["status"]     = "closed"
+                closed += 1
+                mutated = True
+                print(f"  [{reason}] {mkt['slug']} | entry ${entry:.3f} exit ${current_price:.3f} | "
+                      f"{minutes_left:.0f}m left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+            else:
+                print(f"  [SELL FAIL] {mkt['slug']} — will retry next cycle")
+
+        if mutated:
+            save_market(mkt)
+
+    if closed:
+        real_bal = get_real_balance()
+        state["balance"] = round(real_bal if real_bal is not None else balance, 2)
+        save_state(state)
+
+    return closed
 
 
 # =============================================================================
@@ -1126,34 +1440,68 @@ def run_loop() -> None:
         f"  min_ev={_strategy['min_ev']}  min_drift={_strategy['min_drift']*100:.3f}%  "
         f"Kelly={_strategy['kelly_fraction']}  annual_vol={_strategy['annual_vol']:.2f}\n"
         f"  Entry window: [{ENTRY_MIN_SEC}s, {ENTRY_MAX_SEC}s] before close | "
-        f"max_bet=${MAX_BET}"
+        f"max_bet=${MAX_BET}\n"
+        f"  Scan: {SCAN_INTERVAL}s | Monitor: {MONITOR_INTERVAL}s | "
+        f"SL={STOP_LOSS_PCT} | TP_final={TAKE_PROFIT_FINAL} | TP_ROI={TAKE_PROFIT_ROI}"
     )
 
+    real_bal = get_real_balance()
+    if real_bal is None:
+        print(f"  WARNING: Could not fetch on-chain balance — check your keys in config.json")
+    else:
+        print(f"  Wallet USDC: ${real_bal:,.2f}")
+    print(f"  Ctrl+C to stop\n")
+
+    last_full_scan = 0
+
     while not _stop["flag"]:
-        try:
-            state = check_resolved_markets(state)
+        now_ts  = time.time()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            balance    = state["balance"]
-            paper_mode = (not DRY_RUN) and (balance < MIN_TRADEABLE)
-            if paper_mode:
-                print(f"  [{COIN} PAPER MODE] Wallet ${balance:.2f} < ${MIN_TRADEABLE:.2f} — phantom bets only")
+        if now_ts - last_full_scan >= SCAN_INTERVAL:
+            print(f"\n[{now_str}] [{COIN}] full scan...")
+            try:
+                state = check_resolved_markets(state)
 
-            state = run_scan(state, dry_run=DRY_RUN, paper_mode=paper_mode)
-            save_state(state)
+                balance    = state["balance"]
+                paper_mode = (not DRY_RUN) and (balance < MIN_TRADEABLE)
+                if paper_mode:
+                    print(f"  [{COIN} PAPER MODE] Wallet ${balance:.2f} < ${MIN_TRADEABLE:.2f} — phantom bets only")
 
-            cycle_num += 1
-            if cycle_num % 10 == 0:
-                all_markets = load_all_markets()
-                run_calibration(all_markets)
-                tune_strategy(all_markets)
+                state = run_scan(state, dry_run=DRY_RUN, paper_mode=paper_mode)
+                save_state(state)
 
-        except KeyboardInterrupt:
-            _shutdown(signal.SIGINT, None)
-        except Exception as e:
-            print(f"[{COIN} LOOP ERROR] {e}")
+                cycle_num += 1
+                if cycle_num % 10 == 0:
+                    all_markets = load_all_markets()
+                    run_calibration(all_markets)
+                    tune_strategy(all_markets)
+
+                last_full_scan = time.time()
+
+            except KeyboardInterrupt:
+                _shutdown(signal.SIGINT, None)
+            except requests.exceptions.ConnectionError:
+                print(f"  Connection lost — waiting 60 sec")
+                time.sleep(60)
+                continue
+            except Exception as e:
+                print(f"[{COIN} LOOP ERROR] {e}")
+        else:
+            print(f"[{now_str}] [{COIN}] monitoring positions...")
+            try:
+                stopped = monitor_positions()
+                if stopped:
+                    state = load_state()
+                    print(f"  balance: ${state['balance']:,.2f}")
+            except Exception as e:
+                print(f"  Monitor error: {e}")
 
         if not _stop["flag"]:
-            time.sleep(SCAN_INTERVAL)
+            try:
+                time.sleep(MONITOR_INTERVAL)
+            except KeyboardInterrupt:
+                _shutdown(signal.SIGINT, None)
 
 
 # =============================================================================
