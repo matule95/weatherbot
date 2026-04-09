@@ -66,6 +66,7 @@ TAKE_PROFIT_FINAL= _cfg.get("take_profit_final", 0.50)  # <24h remaining
 TAKE_PROFIT_ROI  = _cfg.get("take_profit_roi", 0.40)    # sell when price >= entry * (1 + ROI)
 SCAN_REGIONS          = set(_cfg.get("scan_regions", ["eu"]))
 MAX_CYCLES_PER_MARKET = _cfg.get("max_cycles_per_market", 3)
+MIN_BET               = _cfg.get("min_bet", 1.00)
 
 # CLOB credentials
 POLYMARKET_HOST    = "https://clob.polymarket.com"
@@ -330,6 +331,11 @@ def bucket_prob(forecast, t_low, t_high, sigma=None):
         return norm_cdf((t_high - float(forecast)) / s)
     if t_high == 999:
         return 1.0 - norm_cdf((t_low - float(forecast)) / s)
+    # Single-degree integer bucket (e.g. Celsius markets where range=[22,22]):
+    # treat as [t-0.5, t+0.5] since the market resolves on the nearest integer.
+    if t_low == t_high:
+        t_low -= 0.5
+        t_high += 0.5
     return norm_cdf((t_high - float(forecast)) / s) - norm_cdf((t_low - float(forecast)) / s)
 
 def calc_ev(p, price):
@@ -1063,7 +1069,7 @@ def scan_and_update():
                         if ev >= _strategy["min_ev"]:
                             kelly = calc_kelly(p, yes_price)
                             size = bet_size(kelly, balance)
-                            if size >= 1.00:
+                            if size >= MIN_BET:
                                 candidates.append({
                                     "market_id":    o["market_id"],
                                     "token_id":     o["token_id"],
