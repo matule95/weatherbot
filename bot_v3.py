@@ -67,6 +67,7 @@ TAKE_PROFIT_ROI  = _cfg.get("take_profit_roi", 0.40)    # sell when price >= ent
 SCAN_REGIONS          = set(_cfg.get("scan_regions", ["eu"]))
 MAX_CYCLES_PER_MARKET = _cfg.get("max_cycles_per_market", 3)
 MIN_BET               = _cfg.get("min_bet", 1.00)
+MIN_PRICE             = _cfg.get("min_price", 0.02)
 
 # CLOB credentials
 POLYMARKET_HOST    = "https://clob.polymarket.com"
@@ -80,6 +81,8 @@ POLY_SIG_TYPE      = _cfg.get("signature_type", 0)
 
 SIGMA_F = 2.0
 SIGMA_C = 1.2
+SIGMA_METAR_C = 1.0   # METAR is a real observation; tighter than ECMWF (1.2) but not overconfident about daily max
+SIGMA_METAR_F = 1.5   # Fahrenheit equivalent
 
 DATA_DIR         = Path("weather_bot_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -702,8 +705,13 @@ def save_state(state):
 # CORE LOGIC
 # =============================================================================
 
-def take_forecast_snapshot(city_slug, dates, horizon_map=None):
-    """Fetches forecasts from all sources and returns blended snapshots."""
+def take_forecast_snapshot(city_slug, dates, horizon_map=None, metar_max=None):
+    """Fetches forecasts from all sources and returns blended snapshots.
+
+    metar_max: optional dict {date: float} of running daily-max METAR values
+               already observed this day (from prior scan cycles). Used so a
+               cooling afternoon reading does not erase an earlier peak.
+    """
     now_str = datetime.now(timezone.utc).isoformat()
     ecmwf   = get_ecmwf(city_slug, dates)
     hrrr    = get_hrrr(city_slug, dates)
@@ -712,28 +720,44 @@ def take_forecast_snapshot(city_slug, dates, horizon_map=None):
     snapshots = {}
     for date in dates:
         h = horizon_map.get(date) if horizon_map else None
+        current_metar = get_metar(city_slug) if date == today else None
         snap = {
             "ts":    now_str,
             "ecmwf": ecmwf.get(date),
             "hrrr":  hrrr.get(date) if date <= (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d") else None,
-            "metar": get_metar(city_slug) if date == today else None,
+            "metar": current_metar,
         }
 
+        # For D+0, use the highest METAR reading seen today (running max across
+        # scan cycles). A declining afternoon temp must not erase the observed peak.
+        metar_val = current_metar
+        if metar_max and date in metar_max:
+            metar_val = max(metar_val, metar_max[date]) if metar_val is not None else metar_max[date]
+        snap["metar_max"] = metar_val  # effective value used in blend
+
         loc = LOCATIONS[city_slug]
+        sigma_metar = SIGMA_METAR_C if loc["unit"] == "C" else SIGMA_METAR_F
+
         sources_for_blend = []
+        source_names      = []
         if snap["ecmwf"] is not None:
             s = get_sigma(city_slug, "ecmwf", horizon=h)
             sources_for_blend.append((snap["ecmwf"], s))
+            source_names.append("ecmwf")
         if snap["hrrr"] is not None:
             s = get_sigma(city_slug, "hrrr", horizon=h)
             sources_for_blend.append((snap["hrrr"], s))
+            source_names.append("hrrr")
+        if metar_val is not None:
+            sources_for_blend.append((metar_val, sigma_metar))
+            source_names.append("metar")
 
         if sources_for_blend:
             bt, bs = blend_forecasts(sources_for_blend)
             snap["best"] = bt
             snap["best_sigma"] = bs
-            snap["best_source"] = "blend" if len(sources_for_blend) > 1 else ("hrrr" if snap["hrrr"] is not None and loc["region"] == "us" else "ecmwf")
-            snap["sources_used"] = [("ecmwf" if t == snap.get("ecmwf") else "hrrr") for t, _ in sources_for_blend]
+            snap["best_source"] = "blend" if len(source_names) > 1 else source_names[0]
+            snap["sources_used"] = source_names
         else:
             snap["best"] = None
             snap["best_sigma"] = None
@@ -767,7 +791,19 @@ def scan_and_update():
         try:
             dates = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4)]
             horizon_map = {d: i for i, d in enumerate(dates)}
-            snapshots = take_forecast_snapshot(city_slug, dates, horizon_map=horizon_map)
+            # Build running daily-max METAR from previously stored snapshots so
+            # a cooling afternoon reading can't erase the observed intraday peak.
+            today_str = now.strftime("%Y-%m-%d")
+            metar_max_today = {}
+            existing_today = load_market(city_slug, today_str)
+            if existing_today:
+                past_metar = [
+                    s["metar"] for s in existing_today.get("forecast_snapshots", [])
+                    if s.get("metar") is not None
+                ]
+                if past_metar:
+                    metar_max_today[today_str] = max(past_metar)
+            snapshots = take_forecast_snapshot(city_slug, dates, horizon_map=horizon_map, metar_max=metar_max_today)
             time.sleep(0.3)
         except Exception as e:
             print(f"skipped ({e})")
@@ -834,6 +870,7 @@ def scan_and_update():
                 "ecmwf":       snap.get("ecmwf"),
                 "hrrr":        snap.get("hrrr"),
                 "metar":       snap.get("metar"),
+                "metar_max":   snap.get("metar_max"),
                 "best":        snap.get("best"),
                 "best_source": snap.get("best_source"),
             }
@@ -1065,6 +1102,8 @@ def scan_and_update():
                         if p < 0.01:
                             continue
                         yes_price = o["price"]
+                        if yes_price < MIN_PRICE:
+                            continue
                         ev = calc_ev(p, yes_price)
                         if ev >= _strategy["min_ev"]:
                             kelly = calc_kelly(p, yes_price)
@@ -1105,7 +1144,7 @@ def scan_and_update():
                         real_ask = float(mdata.get("bestAsk", best_signal["entry_price"]))
                         real_bid = float(mdata.get("bestBid", best_signal["entry_price"]))
                         real_spread = round(real_ask - real_bid, 4)
-                        if real_spread > MAX_SLIPPAGE or real_ask >= _strategy["max_price"]:
+                        if real_spread > MAX_SLIPPAGE or real_ask >= _strategy["max_price"] or real_ask < MIN_PRICE:
                             print(f"  [SKIP] {loc['name']} {date} — real ask ${real_ask:.3f} spread ${real_spread:.3f}")
                             skip_position = True
                         else:
