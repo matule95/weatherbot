@@ -891,6 +891,17 @@ def scan_and_update():
             if mkt["status"] != "resolved":
                 pos = get_active_cycle(mkt)
                 need_reconcile = pos is None
+                if need_reconcile:
+                    _cyc = mkt.get("cycles", [])
+                    if len(_cyc) >= MAX_CYCLES_PER_MARKET:
+                        need_reconcile = False  # cycle limit — don't create more
+                    elif _cyc and _cyc[-1].get("closed_at"):
+                        try:
+                            _lc = datetime.fromisoformat(_cyc[-1]["closed_at"].replace("Z", "+00:00"))
+                            if (datetime.now(timezone.utc) - _lc).total_seconds() < 120:
+                                need_reconcile = False  # cooldown — on-chain balance may not have settled
+                        except Exception:
+                            pass
                 if need_reconcile and outcomes:
                     # Check last closed cycle's token first, then scan all outcomes
                     cycles = mkt.get("cycles", [])
@@ -1001,7 +1012,9 @@ def scan_and_update():
                         take_profit = TAKE_PROFIT_LONG
 
                     roi_threshold = entry * (1.0 + TAKE_PROFIT_ROI)
-                    take_triggered = current_price >= take_profit or current_price >= roi_threshold
+                    # Guard: only take profit if current price is above entry — never exit at a loss
+                    # via a take_profit threshold (stop_loss handles downside protection)
+                    take_triggered = (current_price >= take_profit or current_price >= roi_threshold) and current_price > entry
                     stop_triggered = current_price <= stop
 
                     if take_triggered or stop_triggered:
@@ -1305,7 +1318,7 @@ def tune_strategy(markets, state):
     old = dict(_strategy)
     positions = [c for _, c in recent_pairs]
 
-    wins = sum(1 for _, c in recent_pairs if c.get("close_reason") == "resolved" and (c.get("pnl") or 0) > 0)
+    wins = sum(1 for _, c in recent_pairs if (c.get("pnl") or 0) > 0)
     actual_wr = wins / len(recent_pairs) if recent_pairs else 0.5
     avg_predicted_p = sum(p.get("p", 0.5) for p in positions) / len(positions) if positions else 0.5
 
@@ -1498,6 +1511,15 @@ def monitor_positions():
         last_cycle = mkt["cycles"][-1]
         if not last_cycle.get("token_id"):
             continue
+        if len(mkt["cycles"]) >= MAX_CYCLES_PER_MARKET:
+            continue  # cycle limit — don't create more reconciled cycles
+        if last_cycle.get("closed_at"):
+            try:
+                _lc = datetime.fromisoformat(last_cycle["closed_at"].replace("Z", "+00:00"))
+                if (datetime.now(timezone.utc) - _lc).total_seconds() < 120:
+                    continue  # cooldown — on-chain balance may not have settled yet
+            except Exception:
+                pass
         onchain = get_token_balance(last_cycle["token_id"])
         if onchain >= 1.0:
             city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
@@ -1600,7 +1622,9 @@ def monitor_positions():
             print(f"  [TRAILING] {city_name} {mkt['date']} — stop moved to breakeven ${entry:.3f}")
 
         roi_threshold = entry * (1.0 + TAKE_PROFIT_ROI)
-        take_triggered = current_price >= take_profit or current_price >= roi_threshold
+        # Guard: only take profit if current price is above entry — never exit at a loss
+        # via a take_profit threshold (stop_loss handles downside protection)
+        take_triggered = (current_price >= take_profit or current_price >= roi_threshold) and current_price > entry
         stop_triggered = current_price <= stop
 
         if take_triggered or stop_triggered:
