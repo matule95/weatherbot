@@ -40,7 +40,7 @@ from py_clob_client.order_builder.constants import BUY, SELL
 # CONFIG
 # =============================================================================
 
-with open("weather_bot_config.json", encoding="utf-8") as f:
+with open("weather_bot_config_prod.json", encoding="utf-8") as f:
     _cfg = json.load(f)
 
 BALANCE          = _cfg.get("balance", 10000.0)
@@ -692,9 +692,12 @@ def load_state():
     return {
         "balance":          BALANCE,
         "starting_balance": BALANCE,
+        "net_pnl":          0.0,
         "total_trades":     0,
-        "wins":             0,
-        "losses":           0,
+        "profitable_exits": 0,
+        "losing_exits":     0,
+        "resolved_wins":    0,
+        "resolved_losses":  0,
         "peak_balance":     BALANCE,
     }
 
@@ -1027,6 +1030,11 @@ def scan_and_update():
                             pos["close_reason"] = "sold_externally"
                             pos["closed_at"]    = snap.get("ts")
                             closed += 1
+                            state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
+                            if pnl > 0:
+                                state["profitable_exits"] = state.get("profitable_exits", 0) + 1
+                            else:
+                                state["losing_exits"] = state.get("losing_exits", 0) + 1
                             print(f"  [CLOSED] {loc['name']} {date} — 0 shares on-chain, position already sold/resolved")
                         else:
                             resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
@@ -1050,6 +1058,11 @@ def scan_and_update():
                                 pos["pnl"]          = pnl
                                 pos["status"]       = "closed"
                                 closed += 1
+                                state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
+                                if pnl > 0:
+                                    state["profitable_exits"] = state.get("profitable_exits", 0) + 1
+                                else:
+                                    state["losing_exits"] = state.get("losing_exits", 0) + 1
                                 print(f"  [{reason}] {loc['name']} {date} [C{pos['cycle_num']}] | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
                             else:
                                 print(f"  [SELL FAIL] {loc['name']} {date} — will retry next cycle")
@@ -1079,6 +1092,11 @@ def scan_and_update():
                             pos["pnl"]          = pnl
                             pos["status"]       = "closed"
                             closed += 1
+                            state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
+                            if pnl > 0:
+                                state["profitable_exits"] = state.get("profitable_exits", 0) + 1
+                            else:
+                                state["losing_exits"] = state.get("losing_exits", 0) + 1
                             print(f"  [CLOSE] {loc['name']} {date} [C{pos['cycle_num']}] — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
                         else:
                             print(f"  [SELL FAIL] {loc['name']} {date} — will retry next cycle")
@@ -1248,9 +1266,15 @@ def scan_and_update():
                 mkt["actual_temp"] = actual
 
         if won:
-            state["wins"] += 1
+            state["resolved_wins"]   = state.get("resolved_wins", 0) + 1
         else:
-            state["losses"] += 1
+            state["resolved_losses"] = state.get("resolved_losses", 0) + 1
+
+        state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
+        if pnl > 0:
+            state["profitable_exits"] = state.get("profitable_exits", 0) + 1
+        else:
+            state["losing_exits"] = state.get("losing_exits", 0) + 1
 
         result = "WIN" if won else "LOSS"
         print(f"  [{result}] {mkt['city_name']} {mkt['date']} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
@@ -1297,37 +1321,43 @@ def scan_and_update():
 _TUNE_BOUNDS = {
     "kelly_fraction": (0.10, 0.60),
     "min_ev":         (0.03, 0.30),
-    "max_price":      (0.25, 0.65),
+    "max_price":      (0.25, 0.62),
 }
 _TUNE_MAX_STEP = 0.10
 
 def tune_strategy(markets, state):
-    """Adjust strategy parameters based on recent resolved trades."""
-    # Flatten all cycles across resolved markets — each cycle is an independent data point
-    resolved_pairs = [
+    """Adjust strategy parameters based on recent closed cycles."""
+    # Pool A: ALL closed cycles from any market — strategy profitability signal.
+    # Early exits (stop_loss, take_profit, forecast_changed) are valid signal for
+    # ev_bands and price_bands because their PnL tells us whether the entry was worth making.
+    all_closed = [
         (m, c) for m in markets
-        if m.get("status") == "resolved"
         for c in m.get("cycles", [])
         if c.get("pnl") is not None
     ]
-    resolved_pairs.sort(key=lambda x: x[1].get("closed_at", ""))
-    recent_pairs = resolved_pairs[-TUNE_LOOKBACK:] if len(resolved_pairs) >= 20 else []
+    all_closed.sort(key=lambda x: x[1].get("closed_at", ""))
+    recent_pairs = all_closed[-TUNE_LOOKBACK:] if len(all_closed) >= 20 else []
     if not recent_pairs:
         return
 
     old = dict(_strategy)
-    positions = [c for _, c in recent_pairs]
 
-    wins = sum(1 for _, c in recent_pairs if (c.get("pnl") or 0) > 0)
-    actual_wr = wins / len(recent_pairs) if recent_pairs else 0.5
-    avg_predicted_p = sum(p.get("p", 0.5) for p in positions) / len(positions) if positions else 0.5
+    # Pool B: cycles where Polymarket resolved the market — model accuracy signal only.
+    # Restricted to close_reason == "resolved" so early exits don't dilute the kelly signal.
+    # Source is recent_pairs (already time-sorted slice) for consistency.
+    resolved_only = [(m, c) for m, c in recent_pairs if c.get("close_reason") == "resolved"]
+    if resolved_only:
+        kelly_wins      = sum(1 for _, c in resolved_only if (c.get("pnl") or 0) > 0)
+        actual_wr       = kelly_wins / len(resolved_only)
+        avg_predicted_p = sum(c.get("p", 0.5) for _, c in resolved_only) / len(resolved_only)
 
-    if actual_wr > avg_predicted_p + 0.05:
-        adj = min(0.02, _TUNE_MAX_STEP * _strategy["kelly_fraction"])
-        _strategy["kelly_fraction"] = min(_strategy["kelly_fraction"] + adj, _TUNE_BOUNDS["kelly_fraction"][1])
-    elif actual_wr < avg_predicted_p - 0.05:
-        adj = min(0.02, _TUNE_MAX_STEP * _strategy["kelly_fraction"])
-        _strategy["kelly_fraction"] = max(_strategy["kelly_fraction"] - adj, _TUNE_BOUNDS["kelly_fraction"][0])
+        if actual_wr > avg_predicted_p + 0.05:
+            adj = min(0.02, _TUNE_MAX_STEP * _strategy["kelly_fraction"])
+            _strategy["kelly_fraction"] = min(_strategy["kelly_fraction"] + adj, _TUNE_BOUNDS["kelly_fraction"][1])
+        elif actual_wr < avg_predicted_p - 0.05:
+            adj = min(0.02, _TUNE_MAX_STEP * _strategy["kelly_fraction"])
+            _strategy["kelly_fraction"] = max(_strategy["kelly_fraction"] - adj, _TUNE_BOUNDS["kelly_fraction"][0])
+    # if no resolved cycles in pool, kelly stays unchanged — no signal yet
 
     ev_bands = [(0.03, []), (0.05, []), (0.08, []), (0.10, []), (0.15, []), (0.20, [])]
     for _, c in recent_pairs:
@@ -1337,11 +1367,11 @@ def tune_strategy(markets, state):
                 group.append(c.get("pnl", 0) or 0)
 
     best_ev_threshold = _strategy["min_ev"]
-    best_ev_pnl_ratio = 0
+    best_ev_pnl_ratio = None
     for threshold, pnls in ev_bands:
         if len(pnls) >= 5:
-            ratio = sum(pnls) / len(pnls) if pnls else 0
-            if ratio > best_ev_pnl_ratio:
+            ratio = sum(pnls) / len(pnls)
+            if best_ev_pnl_ratio is None or ratio > best_ev_pnl_ratio:
                 best_ev_pnl_ratio = ratio
                 best_ev_threshold = threshold
 
@@ -1357,14 +1387,14 @@ def tune_strategy(markets, state):
             if ep <= ceiling:
                 group.append(c.get("pnl", 0) or 0)
 
-    best_price_ceil = _strategy["max_price"]
-    best_price_pnl = 0
+    best_price_ceil  = _strategy["max_price"]
+    best_price_ratio = None
     for ceiling, pnls in price_bands:
         if len(pnls) >= 5:
-            total = sum(pnls)
-            if total > best_price_pnl:
-                best_price_pnl = total
-                best_price_ceil = ceiling
+            ratio = sum(pnls) / len(pnls)
+            if best_price_ratio is None or ratio > best_price_ratio:
+                best_price_ratio = ratio
+                best_price_ceil  = ceiling
 
     current = _strategy["max_price"]
     delta = best_price_ceil - current
@@ -1391,14 +1421,17 @@ def print_status():
     state    = load_state()
     markets  = load_all_markets()
     open_pos = [m for m in markets if get_active_cycle(m) is not None]
-    resolved = [m for m in markets if m["status"] == "resolved" and m.get("pnl") is not None]
 
     bal     = state["balance"]
     start   = state["starting_balance"]
     ret_pct = (bal - start) / start * 100
-    wins    = state["wins"]
-    losses  = state["losses"]
-    total   = wins + losses
+    prof    = state.get("profitable_exits", 0)
+    loss_e  = state.get("losing_exits", 0)
+    r_wins  = state.get("resolved_wins", 0)
+    r_loss  = state.get("resolved_losses", 0)
+    net_pnl = state.get("net_pnl", 0.0)
+    total   = prof + loss_e
+    r_total = r_wins + r_loss
 
     # Also show live on-chain balance
     real_bal = get_real_balance()
@@ -1409,9 +1442,17 @@ def print_status():
     print(f"{'='*55}")
     print(f"  Balance:     ${bal:,.2f}  (start ${start:,.2f}, {'+'if ret_pct>=0 else ''}{ret_pct:.1f}%)")
     print(real_str)
-    print(f"  Trades:      {total} | W: {wins} | L: {losses} | WR: {wins/total:.0%}" if total else "  No trades yet")
+    if total:
+        pnl_str = f"{'+'if net_pnl>=0 else ''}{net_pnl:.2f}"
+        wr_str  = f"{prof/total:.0%}"
+        print(f"  Exits:       {total} | Profitable: {prof} | Losing: {loss_e} | WR: {wr_str} | Net PnL: {pnl_str}")
+    else:
+        print(f"  Exits:       none yet")
+    if r_total:
+        print(f"  Resolved:    {r_total} | W: {r_wins} | L: {r_loss} | WR: {r_wins/r_total:.0%}")
+    else:
+        print(f"  Resolved:    none yet")
     print(f"  Open:        {len(open_pos)}")
-    print(f"  Resolved:    {len(resolved)}")
 
     if open_pos:
         print(f"\n  Open positions:")
@@ -1638,6 +1679,11 @@ def monitor_positions():
                 pos["closed_at"]    = datetime.now(timezone.utc).isoformat()
                 closed += 1
                 mutated = True
+                state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
+                if pnl > 0:
+                    state["profitable_exits"] = state.get("profitable_exits", 0) + 1
+                else:
+                    state["losing_exits"] = state.get("losing_exits", 0) + 1
                 print(f"  [CLOSED] {city_name} {mkt['date']} — 0 shares on-chain, position already sold/resolved")
             else:
                 resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
@@ -1662,6 +1708,11 @@ def monitor_positions():
                     pos["status"]       = "closed"
                     closed += 1
                     mutated = True
+                    state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
+                    if pnl > 0:
+                        state["profitable_exits"] = state.get("profitable_exits", 0) + 1
+                    else:
+                        state["losing_exits"] = state.get("losing_exits", 0) + 1
                     print(f"  [{reason}] {city_name} {mkt['date']} [C{pos['cycle_num']}] | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
                 else:
                     print(f"  [SELL FAIL] {city_name} {mkt['date']} — will retry next cycle")

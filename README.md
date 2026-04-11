@@ -196,7 +196,7 @@ After the market closes on Polymarket, the bot queries the final YES price:
 - `YES >= 0.95` → WIN — shares pay out at $1.00 each
 - `YES <= 0.05` → LOSS — position goes to $0
 
-Labeled `resolved` in the data. State `wins`/`losses` counters only increment on resolutions, not early exits.
+Labeled `resolved` in the data. State `resolved_wins`/`resolved_losses` counters increment here. All exit paths (including resolutions) also update `profitable_exits`/`losing_exits` and `net_pnl`.
 
 ---
 
@@ -277,13 +277,19 @@ Session-level accounting:
 {
   "balance": 5.46,
   "starting_balance": 5.46,
+  "net_pnl": 0.0,
   "total_trades": 0,
-  "wins": 0,
-  "losses": 0,
+  "profitable_exits": 0,
+  "losing_exits": 0,
+  "resolved_wins": 0,
+  "resolved_losses": 0,
   "peak_balance": 5.46
 }
 ```
-`wins`/`losses` count only market resolutions, not early exits. `balance` is updated on every trade open/close.
+- `profitable_exits`/`losing_exits`: incremented on every cycle close (stop_loss, take_profit, forecast_changed, resolved) based on whether `pnl > 0`
+- `resolved_wins`/`resolved_losses`: incremented only when Polymarket settles the market (temperature confirmed win/loss) — the model accuracy signal used by the tuner's Kelly adjustment
+- `net_pnl`: running sum of all cycle PnLs across all exit types
+- `balance` is updated on every trade open/close
 
 ### `weather_bot_data/strategy.json`
 Tuner output — overrides the config values for `min_ev`, `max_price`, and `kelly_fraction`:
