@@ -40,7 +40,7 @@ from py_clob_client.order_builder.constants import BUY, SELL
 # CONFIG
 # =============================================================================
 
-with open("weather_bot_config_prod.json", encoding="utf-8") as f:
+with open("weather_bot_config.json", encoding="utf-8") as f:
     _cfg = json.load(f)
 
 BALANCE          = _cfg.get("balance", 10000.0)
