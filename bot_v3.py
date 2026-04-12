@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-weatherbet.py — Weather Trading Bot for Polymarket (v3 — REAL TRADES)
-======================================================================
-Identical logic to v2 but executes real trades via py-clob-client.
+bot_v3.py — WeatherBet Trading Bot (v4 Strategy — 2026-04-12)
+=============================================================
+Confidence-first weather market trading bot for Polymarket.
 
-Requires in config.json:
-    polymarket_private_key   — 0x-prefixed private key
-    polymarket_api_key       — CLOB API key (optional — derived if omitted)
-    polymarket_api_secret    — CLOB API secret (optional)
-    polymarket_api_passphrase— CLOB passphrase (optional)
-    polymarket_funder        — funder address (for proxy/gnosis wallets)
-    chain_id                 — 137 (Polygon mainnet, default)
-    signature_type           — 0=EOA, 1=Magic, 2=Gnosis (default 0)
+Strategy summary:
+  Entry:  Find the highest-probability temperature bucket according to the
+          forecast model. Enter only if:
+            - price is in the opportunity zone (min_entry_price..max_entry_price)
+            - confidence P >= min_confidence (default 0.50)
+            - price is flat or rising vs the last scan
+  Exit:   Single ROI target: sell when price >= entry * (1 + take_profit_roi).
+          Stop-loss at entry * stop_loss_pct. Trailing stop locks breakeven.
+  Cycles: Re-enter same bucket if: last cycle profitable, current price is
+          below last exit price, price is still in zone, hours >= min_reentry_hours.
+  Tuner:  Adjusts min_confidence, take_profit_roi, kelly_fraction from data.
+
+See CHANGELOG.md for full history and reasoning.
 
 Usage:
     python bot_v3.py          # main loop
-    python bot_v3.py report   # full report
     python bot_v3.py status   # balance and open positions
+    python bot_v3.py report   # full report
 """
 
 import re
@@ -43,46 +48,44 @@ from py_clob_client.order_builder.constants import BUY, SELL
 with open("weather_bot_config.json", encoding="utf-8") as f:
     _cfg = json.load(f)
 
-BALANCE          = _cfg.get("balance", 10000.0)
-MAX_BET          = _cfg.get("max_bet", 20.0)
-MIN_VOLUME       = _cfg.get("min_volume", 500)
-MIN_HOURS        = _cfg.get("min_hours", 2.0)
-MAX_HOURS        = _cfg.get("max_hours", 72.0)
-MAX_SLIPPAGE     = _cfg.get("max_slippage", 0.03)
-SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)
-CALIBRATION_MIN  = _cfg.get("calibration_min", 30)
-VC_KEY           = _cfg.get("vc_key", "")
-PRIOR_WEIGHT     = _cfg.get("prior_weight", 10)
-MAX_POS_PER_EVENT= _cfg.get("max_positions_per_event", 1)
-TUNE_LOOKBACK    = _cfg.get("tune_lookback", 100)
-TUNE_ENABLED     = _cfg.get("tune_enabled", True)
-MAX_OPEN_POS     = _cfg.get("max_open_positions", 15)
-MAX_POS_PER_DATE = _cfg.get("max_positions_per_date", 6)
-MONITOR_INTERVAL = _cfg.get("monitor_interval", 600)
-STOP_LOSS_PCT    = _cfg.get("stop_loss_pct", 0.80)
-TAKE_PROFIT_SHORT= _cfg.get("take_profit_short", 0.85)  # 24-48h remaining
-TAKE_PROFIT_LONG = _cfg.get("take_profit_long", 0.75)   # >48h remaining
-TAKE_PROFIT_FINAL= _cfg.get("take_profit_final", 0.50)  # <24h remaining
-TAKE_PROFIT_ROI  = _cfg.get("take_profit_roi", 0.40)    # sell when price >= entry * (1 + ROI)
-SCAN_REGIONS          = set(_cfg.get("scan_regions", ["eu"]))
-MAX_CYCLES_PER_MARKET = _cfg.get("max_cycles_per_market", 3)
-MIN_BET               = _cfg.get("min_bet", 1.00)
-MIN_PRICE             = _cfg.get("min_price", 0.02)
+BALANCE           = _cfg.get("balance", 30.0)
+MAX_BET           = _cfg.get("max_bet", 10.0)
+MIN_CONFIDENCE    = _cfg.get("min_confidence", 0.50)     # min P(win) for entry
+MAX_ENTRY_PRICE   = _cfg.get("max_entry_price", 0.65)    # opportunity zone ceiling
+MIN_ENTRY_PRICE   = _cfg.get("min_entry_price", 0.25)    # opportunity zone floor
+MAX_REENTRY_PRICE = _cfg.get("max_reentry_price", 0.65)  # ceiling for re-entry
+MIN_REENTRY_HOURS = _cfg.get("min_reentry_hours", 12.0)  # min hours left for re-entry
+MIN_VOLUME        = _cfg.get("min_volume", 150)
+MIN_HOURS         = _cfg.get("min_hours", 0.5)
+MAX_HOURS         = _cfg.get("max_hours", 72.0)
+MAX_SLIPPAGE      = _cfg.get("max_slippage", 0.06)
+SCAN_INTERVAL     = _cfg.get("scan_interval", 3600)
+VC_KEY            = _cfg.get("vc_key", "")
+PRIOR_WEIGHT      = _cfg.get("prior_weight", 5)
+TUNE_LOOKBACK     = _cfg.get("tune_lookback", 20)
+TUNE_ENABLED      = _cfg.get("tune_enabled", True)
+MAX_OPEN_POS      = _cfg.get("max_open_positions", 10)
+MAX_POS_PER_DATE  = _cfg.get("max_positions_per_date", 5)
+MONITOR_INTERVAL  = _cfg.get("monitor_interval", 300)
+STOP_LOSS_PCT     = _cfg.get("stop_loss_pct", 0.78)
+SCAN_REGIONS      = set(_cfg.get("scan_regions", ["us", "eu"]))
+MAX_CYCLES        = _cfg.get("max_cycles_per_market", 3)
+MIN_BET           = _cfg.get("min_bet", 0.50)
 
 # CLOB credentials
-POLYMARKET_HOST    = "https://clob.polymarket.com"
-POLY_PRIVATE_KEY   = _cfg.get("polymarket_private_key", "")
-POLY_API_KEY       = _cfg.get("polymarket_api_key", "")
-POLY_API_SECRET    = _cfg.get("polymarket_api_secret", "")
-POLY_API_PASSPHRASE= _cfg.get("polymarket_api_passphrase", "")
-POLY_FUNDER        = _cfg.get("polymarket_funder", "")
-POLY_CHAIN_ID      = _cfg.get("chain_id", 137)
-POLY_SIG_TYPE      = _cfg.get("signature_type", 0)
+POLYMARKET_HOST     = "https://clob.polymarket.com"
+POLY_PRIVATE_KEY    = _cfg.get("polymarket_private_key", "")
+POLY_API_KEY        = _cfg.get("polymarket_api_key", "")
+POLY_API_SECRET     = _cfg.get("polymarket_api_secret", "")
+POLY_API_PASSPHRASE = _cfg.get("polymarket_api_passphrase", "")
+POLY_FUNDER         = _cfg.get("polymarket_funder", "")
+POLY_CHAIN_ID       = _cfg.get("chain_id", 137)
+POLY_SIG_TYPE       = _cfg.get("signature_type", 0)
 
-SIGMA_F = 2.0
-SIGMA_C = 1.2
-SIGMA_METAR_C = 1.0   # METAR is a real observation; tighter than ECMWF (1.2) but not overconfident about daily max
-SIGMA_METAR_F = 1.5   # Fahrenheit equivalent
+SIGMA_F       = 2.0   # default forecast sigma in Fahrenheit
+SIGMA_C       = 1.2   # default forecast sigma in Celsius
+SIGMA_METAR_C = 1.0   # METAR is a real observation — tighter sigma
+SIGMA_METAR_F = 1.5
 
 DATA_DIR         = Path("weather_bot_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -94,18 +97,19 @@ STRATEGY_FILE    = DATA_DIR / "strategy.json"
 
 VC_KEY_VALID = bool(VC_KEY) and VC_KEY != "YOUR_KEY_HERE"
 
-# Mutable strategy parameters — overridden by strategy.json when present
+# Mutable strategy — overridden by strategy.json on startup and after each tune
 _strategy = {
-    "min_ev":         _cfg.get("min_ev", 0.10),
-    "max_price":      _cfg.get("max_price", 0.45),
-    "kelly_fraction": _cfg.get("kelly_fraction", 0.25),
+    "min_confidence":  _cfg.get("min_confidence", 0.50),
+    "take_profit_roi": _cfg.get("take_profit_roi", 0.35),
+    "kelly_fraction":  _cfg.get("kelly_fraction", 0.30),
+    "min_ev":          _cfg.get("min_ev", 0.10),
 }
 
 def _load_strategy():
     if STRATEGY_FILE.exists():
         try:
             saved = json.loads(STRATEGY_FILE.read_text(encoding="utf-8"))
-            for k in ("min_ev", "max_price", "kelly_fraction"):
+            for k in ("min_confidence", "take_profit_roi", "kelly_fraction", "min_ev"):
                 if k in saved:
                     _strategy[k] = saved[k]
         except Exception:
@@ -124,6 +128,7 @@ LOCATIONS = {
     "paris":        {"lat": 48.9962,  "lon":    2.5979, "name": "Paris",         "station": "LFPG", "unit": "C", "region": "eu"},
     "munich":       {"lat": 48.3537,  "lon":   11.7750, "name": "Munich",        "station": "EDDM", "unit": "C", "region": "eu"},
     "ankara":       {"lat": 40.1281,  "lon":   32.9951, "name": "Ankara",        "station": "LTAC", "unit": "C", "region": "eu"},
+    # Kept for future use — not scanned unless added to scan_regions
     "seoul":        {"lat": 37.4691,  "lon":  126.4505, "name": "Seoul",         "station": "RKSI", "unit": "C", "region": "asia"},
     "tokyo":        {"lat": 35.7647,  "lon":  140.3864, "name": "Tokyo",         "station": "RJTT", "unit": "C", "region": "asia"},
     "shanghai":     {"lat": 31.1443,  "lon":  121.8083, "name": "Shanghai",      "station": "ZSPD", "unit": "C", "region": "asia"},
@@ -162,7 +167,7 @@ def get_clob_client() -> ClobClient:
     global _clob_client
     if _clob_client is None:
         if not POLY_PRIVATE_KEY:
-            raise RuntimeError("polymarket_private_key not set in config.json")
+            raise RuntimeError("polymarket_private_key not set in config")
         client = ClobClient(
             POLYMARKET_HOST,
             key=POLY_PRIVATE_KEY,
@@ -182,7 +187,6 @@ def get_clob_client() -> ClobClient:
     return _clob_client
 
 def get_real_balance() -> float | None:
-    """Fetch available USDC balance from Polymarket wallet."""
     try:
         resp = get_clob_client().get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
@@ -193,11 +197,7 @@ def get_real_balance() -> float | None:
         return None
 
 def place_buy_order(token_id: str, cost: float) -> dict | None:
-    """
-    Place a market BUY order for `cost` USDC worth of YES tokens.
-    Tries FOK first, falls back to FAK.
-    Returns the response dict on success, None on failure.
-    """
+    """Place a market BUY order for `cost` USDC. Tries FOK then FAK."""
     client = get_clob_client()
     mo = MarketOrderArgs(token_id=token_id, amount=cost, side=BUY)
     for order_type in (OrderType.FOK, OrderType.FAK):
@@ -213,16 +213,13 @@ def place_buy_order(token_id: str, cost: float) -> dict | None:
 def place_sell_order(token_id: str, size: float, price: float, market_id: str = None) -> dict | None:
     """
     Place a limit FAK SELL order for `size` shares.
-    Uses best bid from Polymarket for pricing to ensure fills.
-    Falls back to `price` if best bid unavailable.
-    Queries actual conditional token balance first and caps size to what's
-    available, preventing "not enough balance" errors from partial fills.
-    Returns the response dict on success, None on failure.
+    Fetches actual on-chain balance first to prevent over-sell errors.
+    Uses best bid for realistic fill pricing.
     """
     client = get_clob_client()
-
-    # Check actual on-chain token balance before attempting sell
     actual_size = round(size, 2)
+
+    # Cap size to on-chain balance (partial fills on buy are common)
     try:
         bal_resp = client.get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
@@ -232,13 +229,12 @@ def place_sell_order(token_id: str, size: float, price: float, market_id: str = 
             print(f"  [SELL] Token balance too low ({available:.2f} shares), skipping")
             return None
         if available < actual_size:
-            floored = math.floor(available * 100) / 100
-            print(f"  [SELL] Capping size {actual_size:.2f} → {floored:.2f} (partial fill on buy)")
-            actual_size = floored
+            actual_size = math.floor(available * 100) / 100
+            print(f"  [SELL] Capping size {size:.2f} → {actual_size:.2f} (partial fill)")
     except Exception as e:
         print(f"  [SELL] Could not check token balance: {e} — using recorded size")
 
-    # Fetch best bid for realistic sell pricing
+    # Use best bid for realistic fill
     sell_price = price
     if market_id:
         try:
@@ -248,7 +244,7 @@ def place_sell_order(token_id: str, size: float, price: float, market_id: str = 
             if best_bid is not None:
                 sell_price = float(best_bid)
                 if sell_price != price:
-                    print(f"  [SELL] Using best bid ${sell_price:.3f} (market ${price:.3f})")
+                    print(f"  [SELL] Using best bid ${sell_price:.3f} (last known ${price:.3f})")
         except Exception:
             pass
 
@@ -275,12 +271,10 @@ def place_sell_order(token_id: str, size: float, price: float, market_id: str = 
         return None
 
 def get_token_balance(token_id: str) -> float:
-    """Query on-chain conditional token balance (in shares)."""
     if not token_id:
         return 0.0
     try:
-        client = get_clob_client()
-        bal_resp = client.get_balance_allowance(
+        bal_resp = get_clob_client().get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
         )
         return float(bal_resp["balance"]) / 1e6
@@ -301,15 +295,13 @@ def get_real_entry_price(token_id: str) -> float | None:
         if not trades:
             return None
 
-        total_cost = 0.0
-        total_shares = 0.0
+        total_cost, total_shares = 0.0, 0.0
         for t in trades:
-            side = (t.get("side") or "").upper()
-            if side == "BUY":
+            if (t.get("side") or "").upper() == "BUY":
                 price = float(t.get("price", 0))
-                size = float(t.get("size", 0))
+                size  = float(t.get("size", 0))
                 if price > 0 and size > 0:
-                    total_cost += price * size
+                    total_cost   += price * size
                     total_shares += size
 
         if total_shares > 0:
@@ -326,7 +318,14 @@ def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 def bucket_prob(forecast, t_low, t_high, sigma=None):
-    """CDF-based probability for all bucket types including regular buckets."""
+    """Gaussian CDF probability for all bucket types.
+
+    Terminal buckets (t_low=-999 or t_high=999) use the raw boundary.
+    All bounded buckets expand by ±0.5 degrees to account for integer
+    temperature resolution: "72-73°F" resolves YES on any reading that
+    rounds to 72 or 73, i.e., continuous range [71.5, 73.5].  The same
+    logic applies to EU single-degree buckets (t_low == t_high).
+    """
     s = sigma or 2.0
     if s <= 0:
         s = 0.01
@@ -334,26 +333,24 @@ def bucket_prob(forecast, t_low, t_high, sigma=None):
         return norm_cdf((t_high - float(forecast)) / s)
     if t_high == 999:
         return 1.0 - norm_cdf((t_low - float(forecast)) / s)
-    # Single-degree integer bucket (e.g. Celsius markets where range=[22,22]):
-    # treat as [t-0.5, t+0.5] since the market resolves on the nearest integer.
-    if t_low == t_high:
-        t_low -= 0.5
-        t_high += 0.5
-    return norm_cdf((t_high - float(forecast)) / s) - norm_cdf((t_low - float(forecast)) / s)
+    # Bounded bucket — expand by ±0.5 for integer rounding on both EU and US markets
+    return norm_cdf((t_high + 0.5 - float(forecast)) / s) - norm_cdf((t_low - 0.5 - float(forecast)) / s)
 
 def calc_ev(p, price):
-    if price <= 0 or price >= 1: return 0.0
+    """Expected value per dollar risked: p/price - 1 (positive = we have edge over market)."""
+    if price <= 0 or price >= 1:
+        return 0.0
     return round(p * (1.0 / price - 1.0) - (1.0 - p), 4)
 
 def calc_kelly(p, price):
-    if price <= 0 or price >= 1: return 0.0
+    if price <= 0 or price >= 1:
+        return 0.0
     b = 1.0 / price - 1.0
     f = (p * b - (1.0 - p)) / b
     return round(min(max(0.0, f) * _strategy["kelly_fraction"], 1.0), 4)
 
 def bet_size(kelly, balance):
-    raw = kelly * balance
-    return round(min(raw, MAX_BET), 2)
+    return round(min(kelly * balance, MAX_BET), 2)
 
 # =============================================================================
 # CALIBRATION
@@ -367,7 +364,6 @@ def load_cal():
     return {}
 
 def get_sigma(city_slug, source="ecmwf", horizon=None):
-    """Lookup calibrated sigma with fallback: city_source_d{h} -> city_source -> default."""
     if horizon is not None:
         h_key = f"{city_slug}_{source}_d{horizon}"
         if h_key in _cal:
@@ -378,19 +374,18 @@ def get_sigma(city_slug, source="ecmwf", horizon=None):
     return SIGMA_F if LOCATIONS[city_slug]["unit"] == "F" else SIGMA_C
 
 def run_calibration(markets):
-    """Recalculates sigma from resolved markets using Bayesian update, per horizon."""
     resolved = [m for m in markets if m.get("status") == "resolved" and m.get("actual_temp") is not None]
     if not resolved:
         return load_cal()
 
-    cal = load_cal()
+    cal     = load_cal()
     updated = []
 
     for source in ["ecmwf", "hrrr"]:
         for city in set(m["city"] for m in resolved):
             if city not in LOCATIONS:
                 continue
-            group = [m for m in resolved if m["city"] == city]
+            group       = [m for m in resolved if m["city"] == city]
             prior_sigma = SIGMA_F if LOCATIONS[city]["unit"] == "F" else SIGMA_C
 
             horizon_errors: dict[str, list] = {}
@@ -445,11 +440,10 @@ def run_calibration(markets):
 # =============================================================================
 
 def get_ecmwf(city_slug, dates):
-    """ECMWF via Open-Meteo with bias correction. For all cities."""
-    loc = LOCATIONS[city_slug]
-    unit = loc["unit"]
+    loc       = LOCATIONS[city_slug]
+    unit      = loc["unit"]
     temp_unit = "fahrenheit" if unit == "F" else "celsius"
-    result = {}
+    result    = {}
     url = (
         f"https://api.open-meteo.com/v1/forecast"
         f"?latitude={loc['lat']}&longitude={loc['lon']}"
@@ -473,7 +467,6 @@ def get_ecmwf(city_slug, dates):
     return result
 
 def get_hrrr(city_slug, dates):
-    """HRRR via Open-Meteo. US cities only, up to 48h horizon."""
     loc = LOCATIONS[city_slug]
     if loc["region"] != "us":
         return {}
@@ -483,7 +476,7 @@ def get_hrrr(city_slug, dates):
         f"?latitude={loc['lat']}&longitude={loc['lon']}"
         f"&daily=temperature_2m_max&temperature_unit=fahrenheit"
         f"&forecast_days=3&timezone={TIMEZONES.get(city_slug, 'UTC')}"
-        f"&models=gfs_seamless"  # HRRR+GFS seamless — best option for US
+        f"&models=gfs_seamless"
     )
     for attempt in range(3):
         try:
@@ -501,12 +494,12 @@ def get_hrrr(city_slug, dates):
     return result
 
 def get_metar(city_slug):
-    """Current observed temperature from METAR station. D+0 only."""
-    loc = LOCATIONS[city_slug]
+    """Current observed temperature from METAR. D+0 only."""
+    loc     = LOCATIONS[city_slug]
     station = loc["station"]
-    unit = loc["unit"]
+    unit    = loc["unit"]
     try:
-        url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=json"
+        url  = f"https://aviationweather.gov/api/data/metar?ids={station}&format=json"
         resp = requests.get(url, timeout=(5, 8))
         if not resp.text or not resp.text.strip():
             return None
@@ -515,16 +508,16 @@ def get_metar(city_slug):
             temp_c = data[0].get("temp")
             if temp_c is not None:
                 if unit == "F":
-                    return round(float(temp_c) * 9/5 + 32)
+                    return round(float(temp_c) * 9 / 5 + 32)
                 return round(float(temp_c), 1)
     except Exception as e:
         print(f"  [METAR] {city_slug}: {e}")
     return None
 
 def get_actual_temp(city_slug, date_str):
-    loc = LOCATIONS[city_slug]
+    loc     = LOCATIONS[city_slug]
     station = loc["station"]
-    unit = loc["unit"]
+    unit    = loc["unit"]
     vc_unit = "us" if unit == "F" else "metric"
     url = (
         f"https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
@@ -540,20 +533,110 @@ def get_actual_temp(city_slug, date_str):
         print(f"  [VC] {city_slug} {date_str}: {e}")
     return None
 
+def blend_forecasts(temps_and_sigmas):
+    """Inverse-variance weighted blend of (temp, sigma) tuples."""
+    if not temps_and_sigmas:
+        return None, None
+    if len(temps_and_sigmas) == 1:
+        return temps_and_sigmas[0]
+    weights      = [1.0 / (s ** 2) for _, s in temps_and_sigmas]
+    total_w      = sum(weights)
+    blended_temp = sum(t * w for (t, _), w in zip(temps_and_sigmas, weights)) / total_w
+    blended_sigma = math.sqrt(1.0 / total_w)
+    return round(blended_temp, 1), round(blended_sigma, 3)
+
+def take_forecast_snapshot(city_slug, dates, horizon_map=None, metar_max=None):
+    """Fetches all forecast sources and returns blended snapshots per date."""
+    now_str = datetime.now(timezone.utc).isoformat()
+    ecmwf   = get_ecmwf(city_slug, dates)
+    hrrr    = get_hrrr(city_slug, dates)
+    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    snapshots = {}
+    for date in dates:
+        h           = horizon_map.get(date) if horizon_map else None
+        current_metar = get_metar(city_slug) if date == today else None
+        snap = {
+            "ts":    now_str,
+            "ecmwf": ecmwf.get(date),
+            "hrrr":  hrrr.get(date) if date <= (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d") else None,
+            "metar": current_metar,
+        }
+
+        # Running daily-max METAR — don't let a cooling afternoon erase the peak
+        metar_val = current_metar
+        if metar_max and date in metar_max:
+            metar_val = max(metar_val, metar_max[date]) if metar_val is not None else metar_max[date]
+        snap["metar_max"] = metar_val
+
+        loc         = LOCATIONS[city_slug]
+        sigma_metar = SIGMA_METAR_C if loc["unit"] == "C" else SIGMA_METAR_F
+
+        sources_for_blend = []
+        source_names      = []
+        if snap["ecmwf"] is not None:
+            s = get_sigma(city_slug, "ecmwf", horizon=h)
+            sources_for_blend.append((snap["ecmwf"], s))
+            source_names.append("ecmwf")
+        if snap["hrrr"] is not None:
+            s = get_sigma(city_slug, "hrrr", horizon=h)
+            sources_for_blend.append((snap["hrrr"], s))
+            source_names.append("hrrr")
+        if metar_val is not None:
+            sources_for_blend.append((metar_val, sigma_metar))
+            source_names.append("metar")
+
+        if sources_for_blend:
+            bt, bs = blend_forecasts(sources_for_blend)
+            snap["best"]        = bt
+            snap["best_sigma"]  = bs
+            snap["best_source"] = "blend" if len(source_names) > 1 else source_names[0]
+            snap["sources_used"] = source_names
+        else:
+            snap["best"]        = None
+            snap["best_sigma"]  = None
+            snap["best_source"] = None
+            snap["sources_used"] = []
+
+        snapshots[date] = snap
+    return snapshots
+
+# =============================================================================
+# POLYMARKET
+# =============================================================================
+
+def get_polymarket_event(city_slug, month, day, year):
+    slug = f"highest-temperature-in-{city_slug}-on-{month}-{day}-{year}"
+    try:
+        r    = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=(5, 8))
+        data = r.json()
+        if data and isinstance(data, list) and len(data) > 0:
+            return data[0]
+    except Exception:
+        pass
+    return None
+
+def get_market_price(market_id):
+    try:
+        r      = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(3, 5))
+        prices = json.loads(r.json().get("outcomePrices", "[0.5,0.5]"))
+        return float(prices[0])
+    except Exception:
+        return None
+
 def check_market_resolved(market_id):
     """
-    Checks if the market closed on Polymarket and who won.
-    Returns: (None, closed_at_str) if still open/indeterminate,
-             (True, closed_at_str) if YES won, (False, closed_at_str) if NO won.
+    Returns (True, closed_at) for YES win, (False, closed_at) for loss,
+    (None, closed_at) if still open or indeterminate.
     """
     try:
-        r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(5, 8))
+        r    = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(5, 8))
         data = r.json()
-        closed = data.get("closed", False)
+        closed    = data.get("closed", False)
         closed_at = data.get("endDate") or data.get("closedTime") or ""
         if not closed:
             return None, ""
-        prices = json.loads(data.get("outcomePrices", "[0.5,0.5]"))
+        prices    = json.loads(data.get("outcomePrices", "[0.5,0.5]"))
         yes_price = float(prices[0])
         if yes_price >= 0.95:
             return True, closed_at
@@ -564,52 +647,21 @@ def check_market_resolved(market_id):
         print(f"  [RESOLVE] {market_id}: {e}")
     return None, ""
 
-def blend_forecasts(temps_and_sigmas):
-    """Inverse-variance weighted blend of (temp, sigma) tuples. ECMWF + HRRR only."""
-    if not temps_and_sigmas:
-        return None, None
-    if len(temps_and_sigmas) == 1:
-        return temps_and_sigmas[0]
-    weights = [1.0 / (s ** 2) for _, s in temps_and_sigmas]
-    total_w = sum(weights)
-    blended_temp = sum(t * w for (t, _), w in zip(temps_and_sigmas, weights)) / total_w
-    blended_sigma = math.sqrt(1.0 / total_w)
-    return round(blended_temp, 1), round(blended_sigma, 3)
-
-# =============================================================================
-# POLYMARKET
-# =============================================================================
-
-def get_polymarket_event(city_slug, month, day, year):
-    slug = f"highest-temperature-in-{city_slug}-on-{month}-{day}-{year}"
-    try:
-        r = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=(5, 8))
-        data = r.json()
-        if data and isinstance(data, list) and len(data) > 0:
-            return data[0]
-    except Exception:
-        pass
-    return None
-
-def get_market_price(market_id):
-    try:
-        r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(3, 5))
-        prices = json.loads(r.json().get("outcomePrices", "[0.5,0.5]"))
-        return float(prices[0])
-    except Exception:
-        return None
-
 def parse_temp_range(question):
-    if not question: return None
+    if not question:
+        return None
     num = r'(-?\d+(?:\.\d+)?)'
     if re.search(r'or below', question, re.IGNORECASE):
         m = re.search(num + r'[°]?[FC] or below', question, re.IGNORECASE)
-        if m: return (-999.0, float(m.group(1)))
+        if m:
+            return (-999.0, float(m.group(1)))
     if re.search(r'or higher', question, re.IGNORECASE):
         m = re.search(num + r'[°]?[FC] or higher', question, re.IGNORECASE)
-        if m: return (float(m.group(1)), 999.0)
+        if m:
+            return (float(m.group(1)), 999.0)
     m = re.search(r'between ' + num + r'-' + num + r'[°]?[FC]', question, re.IGNORECASE)
-    if m: return (float(m.group(1)), float(m.group(2)))
+    if m:
+        return (float(m.group(1)), float(m.group(2)))
     m = re.search(r'be ' + num + r'[°]?[FC] on', question, re.IGNORECASE)
     if m:
         v = float(m.group(1))
@@ -676,7 +728,7 @@ def new_market(city_slug, date_str, event, hours):
     }
 
 def get_active_cycle(market_data):
-    """Return the currently open cycle dict, or None if no open cycle exists."""
+    """Return the currently open cycle dict, or None."""
     for cycle in market_data.get("cycles", []):
         if cycle.get("status") == "open":
             return cycle
@@ -689,94 +741,209 @@ def get_active_cycle(market_data):
 def load_state():
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    # Fresh start: use actual on-chain balance, fall back to config value
+    real_bal = get_real_balance()
+    starting = round(real_bal, 2) if real_bal is not None else BALANCE
+    if real_bal is not None:
+        print(f"  [INIT] On-chain balance detected: ${starting:.2f} — using as starting balance")
+    else:
+        print(f"  [INIT] Could not fetch on-chain balance — using config default ${starting:.2f}")
     return {
-        "balance":          BALANCE,
-        "starting_balance": BALANCE,
+        "balance":          starting,
+        "starting_balance": starting,
         "net_pnl":          0.0,
         "total_trades":     0,
         "profitable_exits": 0,
         "losing_exits":     0,
         "resolved_wins":    0,
         "resolved_losses":  0,
-        "peak_balance":     BALANCE,
+        "peak_balance":     starting,
     }
 
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 # =============================================================================
-# CORE LOGIC
+# ENTRY EVALUATION  (the core new logic)
 # =============================================================================
 
-def take_forecast_snapshot(city_slug, dates, horizon_map=None, metar_max=None):
-    """Fetches forecasts from all sources and returns blended snapshots.
-
-    metar_max: optional dict {date: float} of running daily-max METAR values
-               already observed this day (from prior scan cycles). Used so a
-               cooling afternoon reading does not erase an earlier peak.
+def is_price_stable_or_rising(market_record, token_id, window=2):
     """
-    now_str = datetime.now(timezone.utc).isoformat()
-    ecmwf   = get_ecmwf(city_slug, dates)
-    hrrr    = get_hrrr(city_slug, dates)
-    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    Returns True if the bucket's price is flat or rising over recent scans.
+    Returns True when no history exists (first scan — allow entry).
+    A price is "falling" if it dropped more than 5% over the last N snapshots.
+    """
+    snaps_with_prices = [
+        s for s in market_record.get("market_snapshots", [])
+        if isinstance(s.get("prices"), dict)
+    ]
+    if len(snaps_with_prices) < 2:
+        return True  # no price history yet — allow entry
 
-    snapshots = {}
-    for date in dates:
-        h = horizon_map.get(date) if horizon_map else None
-        current_metar = get_metar(city_slug) if date == today else None
-        snap = {
-            "ts":    now_str,
-            "ecmwf": ecmwf.get(date),
-            "hrrr":  hrrr.get(date) if date <= (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d") else None,
-            "metar": current_metar,
+    recent = snaps_with_prices[-window:]
+    prices = [s["prices"].get(token_id) for s in recent]
+    prices = [p for p in prices if p is not None]
+
+    if len(prices) < 2:
+        return True  # token not in history yet
+
+    # Allow entry if the latest price >= 95% of the oldest in the window
+    return prices[-1] >= prices[0] * 0.95
+
+
+def find_best_entry(outcomes, forecast_temp, sigma, balance, market_record):
+    """
+    Find the best entry candidate using the v4 confidence-first strategy.
+
+    Scores all buckets by probability. Selects the highest-probability bucket
+    that satisfies all entry gates. Returns an entry dict or None.
+
+    Gates (all must pass):
+      1. Price in opportunity zone: MIN_ENTRY_PRICE..MAX_ENTRY_PRICE
+      2. Edge: EV = p/price - 1 >= min_ev (we have edge over market implied probability)
+      3. Longshot floor: p >= 0.10 (never bet on < 10% regardless of price)
+      4. Price trend: flat or rising vs last scan
+      5. Volume >= MIN_VOLUME
+      6. Bet size >= MIN_BET after Kelly sizing
+    """
+    if not outcomes or forecast_temp is None:
+        return None
+
+    min_ev = _strategy.get("min_ev", 0.10)
+
+    # Score all buckets by probability descending
+    scored = []
+    for o in outcomes:
+        t_low, t_high = o["range"]
+        p = bucket_prob(forecast_temp, t_low, t_high, sigma)
+        scored.append((p, o))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    for p, o in scored:
+        # Hard longshot floor — sorted list, so all below this also fail
+        if p < 0.10:
+            break
+
+        yes_price = o["price"]
+
+        # Gate: opportunity zone
+        if yes_price < MIN_ENTRY_PRICE or yes_price > MAX_ENTRY_PRICE:
+            continue
+
+        # Gate: edge over market — our model must assign meaningfully more
+        # probability than the market price implies (EV = p/price - 1)
+        ev = calc_ev(p, yes_price)
+        if ev < min_ev:
+            continue
+
+        # Gate: minimum volume
+        if o.get("volume", 0) < MIN_VOLUME:
+            continue
+
+        # Gate: price trend (flat or rising)
+        if not is_price_stable_or_rising(market_record, o.get("token_id", ""), window=2):
+            continue
+
+        # Gate: minimum bet size
+        kelly = calc_kelly(p, yes_price)
+        size  = bet_size(kelly, balance)
+        if size < MIN_BET:
+            continue
+
+        return {
+            "market_id":    o["market_id"],
+            "token_id":     o["token_id"],
+            "question":     o["question"],
+            "bucket_low":   o["range"][0],
+            "bucket_high":  o["range"][1],
+            "entry_price":  yes_price,
+            "shares":       round(size / yes_price, 2),
+            "cost":         size,
+            "p":            round(p, 4),
+            "ev":           round(ev, 4),
+            "kelly":        round(kelly, 4),
         }
 
-        # For D+0, use the highest METAR reading seen today (running max across
-        # scan cycles). A declining afternoon temp must not erase the observed peak.
-        metar_val = current_metar
-        if metar_max and date in metar_max:
-            metar_val = max(metar_val, metar_max[date]) if metar_val is not None else metar_max[date]
-        snap["metar_max"] = metar_val  # effective value used in blend
+    return None
 
-        loc = LOCATIONS[city_slug]
-        sigma_metar = SIGMA_METAR_C if loc["unit"] == "C" else SIGMA_METAR_F
 
-        sources_for_blend = []
-        source_names      = []
-        if snap["ecmwf"] is not None:
-            s = get_sigma(city_slug, "ecmwf", horizon=h)
-            sources_for_blend.append((snap["ecmwf"], s))
-            source_names.append("ecmwf")
-        if snap["hrrr"] is not None:
-            s = get_sigma(city_slug, "hrrr", horizon=h)
-            sources_for_blend.append((snap["hrrr"], s))
-            source_names.append("hrrr")
-        if metar_val is not None:
-            sources_for_blend.append((metar_val, sigma_metar))
-            source_names.append("metar")
+def evaluate_reentry(cycles, outcomes, forecast_temp, sigma, hours):
+    """
+    Evaluate whether re-entry on the same market is allowed.
 
-        if sources_for_blend:
-            bt, bs = blend_forecasts(sources_for_blend)
-            snap["best"] = bt
-            snap["best_sigma"] = bs
-            snap["best_source"] = "blend" if len(source_names) > 1 else source_names[0]
-            snap["sources_used"] = source_names
-        else:
-            snap["best"] = None
-            snap["best_sigma"] = None
-            snap["best_source"] = None
-            snap["sources_used"] = []
+    Returns a partial entry dict for the same bucket, or None.
 
-        snapshots[date] = snap
-    return snapshots
+    Re-entry gates (all must pass):
+      1. Last cycle was profitable (pnl > 0)
+      2. Current price < last exit price (not chasing)
+      3. Current price <= MAX_REENTRY_PRICE (still in opportunity zone)
+      4. hours >= MIN_REENTRY_HOURS
+      5. Fresh P >= min_confidence on the same bucket
+    """
+    if not cycles:
+        return None
+
+    last = cycles[-1]
+    if (last.get("pnl") or 0) <= 0:
+        return None  # last cycle was not profitable
+
+    if hours < MIN_REENTRY_HOURS:
+        return None
+
+    last_exit_price = last.get("exit_price") or 1.0
+    last_token      = last.get("token_id")
+    t_low           = last.get("bucket_low")
+    t_high          = last.get("bucket_high")
+
+    if not last_token or t_low is None or t_high is None:
+        return None
+
+    # Find the same bucket in current outcomes
+    current_outcome = next((o for o in outcomes if o.get("token_id") == last_token), None)
+    if current_outcome is None:
+        return None
+
+    current_price = current_outcome["price"]
+
+    # Gate: price must have come back down below where we sold
+    if current_price >= last_exit_price:
+        return None
+
+    # Gate: still in opportunity zone
+    if current_price > MAX_REENTRY_PRICE or current_price < MIN_ENTRY_PRICE:
+        return None
+
+    # Gate: fresh edge check on the same bucket — require min EV
+    if forecast_temp is None:
+        return None
+    p = bucket_prob(forecast_temp, t_low, t_high, sigma)
+    if p < 0.10:
+        return None
+    if calc_ev(p, current_price) < _strategy.get("min_ev", 0.10):
+        return None
+
+    return {
+        "market_id":  last["market_id"],
+        "token_id":   last_token,
+        "question":   last.get("question"),
+        "bucket_low": t_low,
+        "bucket_high": t_high,
+        "price":      current_price,
+        "p":          round(p, 4),
+        "volume":     current_outcome.get("volume", 0),
+    }
+
+# =============================================================================
+# CORE SCAN LOOP
+# =============================================================================
+
 
 def scan_and_update():
-    """Main function of one cycle: updates forecasts, opens/closes positions."""
+    """Full scan: update forecasts, open/close positions, calibrate, tune."""
     global _cal
-    now      = datetime.now(timezone.utc)
-    state    = load_state()
+    now   = datetime.now(timezone.utc)
+    state = load_state()
 
-    # Use real on-chain balance for Kelly sizing
     real_bal = get_real_balance()
     balance  = real_bal if real_bal is not None else state["balance"]
 
@@ -787,18 +954,18 @@ def scan_and_update():
     for city_slug, loc in LOCATIONS.items():
         if loc.get("region") not in SCAN_REGIONS:
             continue
-        unit = loc["unit"]
+        unit     = loc["unit"]
         unit_sym = "F" if unit == "F" else "C"
         print(f"  -> {loc['name']}...", end=" ", flush=True)
 
         try:
-            dates = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4)]
-            horizon_map = {d: i for i, d in enumerate(dates)}
-            # Build running daily-max METAR from previously stored snapshots so
-            # a cooling afternoon reading can't erase the observed intraday peak.
-            today_str = now.strftime("%Y-%m-%d")
+            dates        = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4)]
+            horizon_map  = {d: i for i, d in enumerate(dates)}
+            today_str    = now.strftime("%Y-%m-%d")
+
+            # Preserve running daily-max METAR so a cooling afternoon doesn't erase peak
             metar_max_today = {}
-            existing_today = load_market(city_slug, today_str)
+            existing_today  = load_market(city_slug, today_str)
             if existing_today:
                 past_metar = [
                     s["metar"] for s in existing_today.get("forecast_snapshots", [])
@@ -806,7 +973,10 @@ def scan_and_update():
                 ]
                 if past_metar:
                     metar_max_today[today_str] = max(past_metar)
-            snapshots = take_forecast_snapshot(city_slug, dates, horizon_map=horizon_map, metar_max=metar_max_today)
+
+            snapshots = take_forecast_snapshot(
+                city_slug, dates, horizon_map=horizon_map, metar_max=metar_max_today
+            )
             time.sleep(0.3)
         except Exception as e:
             print(f"skipped ({e})")
@@ -831,6 +1001,7 @@ def scan_and_update():
             if mkt["status"] == "resolved":
                 continue
 
+            # Parse all outcome buckets for this event date
             outcomes = []
             for market in event.get("markets", []):
                 question = market.get("question", "")
@@ -840,7 +1011,7 @@ def scan_and_update():
                 if not rng:
                     continue
                 try:
-                    prices = json.loads(market.get("outcomePrices", "[0.5,0.5]"))
+                    prices    = json.loads(market.get("outcomePrices", "[0.5,0.5]"))
                     yes_price = float(prices[0])
                 except Exception:
                     continue
@@ -861,12 +1032,16 @@ def scan_and_update():
                     "price":     round(yes_price, 4),
                     "volume":    round(volume, 0),
                 })
-
             outcomes.sort(key=lambda x: x["range"][0])
             mkt["all_outcomes"] = outcomes
 
-            snap = snapshots.get(date, {})
-            forecast_snap = {
+            # Forecast snapshot for this date
+            snap         = snapshots.get(date, {})
+            forecast_temp = snap.get("best")
+            best_source   = snap.get("best_source")
+            sigma         = snap.get("best_sigma") or get_sigma(city_slug, best_source or "ecmwf", horizon=i)
+
+            mkt["forecast_snapshots"].append({
                 "ts":          snap.get("ts"),
                 "horizon":     horizon,
                 "hours_left":  round(hours, 1),
@@ -876,56 +1051,55 @@ def scan_and_update():
                 "metar_max":   snap.get("metar_max"),
                 "best":        snap.get("best"),
                 "best_source": snap.get("best_source"),
-            }
-            mkt["forecast_snapshots"].append(forecast_snap)
+            })
 
-            top = max(outcomes, key=lambda x: x["price"]) if outcomes else None
-            market_snap = {
-                "ts":         snap.get("ts"),
-                "top_bucket": f"{top['range'][0]}-{top['range'][1]}{unit_sym}" if top else None,
-                "top_price":  top["price"] if top else None,
-            }
-            mkt["market_snapshots"].append(market_snap)
+            # Market snapshot: store per-token prices for trend detection
+            mkt["market_snapshots"].append({
+                "ts":     snap.get("ts"),
+                "prices": {o["token_id"]: o["price"] for o in outcomes if o.get("token_id")},
+            })
 
-            forecast_temp = snap.get("best")
-            best_source   = snap.get("best_source")
+            ts_now = snap.get("ts") or now.isoformat()
 
-            # --- RECONCILE: detect on-chain positions not tracked locally ---
-            if mkt["status"] != "resolved":
-                pos = get_active_cycle(mkt)
-                need_reconcile = pos is None
-                if need_reconcile:
-                    _cyc = mkt.get("cycles", [])
-                    if len(_cyc) >= MAX_CYCLES_PER_MARKET:
-                        need_reconcile = False  # cycle limit — don't create more
-                    elif _cyc and _cyc[-1].get("closed_at"):
-                        try:
-                            _lc = datetime.fromisoformat(_cyc[-1]["closed_at"].replace("Z", "+00:00"))
-                            if (datetime.now(timezone.utc) - _lc).total_seconds() < 120:
-                                need_reconcile = False  # cooldown — on-chain balance may not have settled
-                        except Exception:
-                            pass
-                if need_reconcile and outcomes:
-                    # Check last closed cycle's token first, then scan all outcomes
-                    cycles = mkt.get("cycles", [])
+            # ---- RECONCILE: detect orphaned on-chain positions ----
+            pos = get_active_cycle(mkt)
+            if pos is None and mkt["status"] != "resolved":
+                cycles = mkt.get("cycles", [])
+                can_reconcile = (
+                    len(cycles) < MAX_CYCLES and
+                    not (cycles and cycles[-1].get("closed_at") and
+                         (now - datetime.fromisoformat(
+                             cycles[-1]["closed_at"].replace("Z", "+00:00")
+                         )).total_seconds() < 120)
+                )
+                if can_reconcile and outcomes:
+                    # Check last cycle's token first, then scan all outcomes
                     last_cycle = cycles[-1] if cycles else None
+                    candidates_to_check = []
                     if last_cycle and last_cycle.get("token_id"):
-                        onchain = get_token_balance(last_cycle["token_id"])
+                        candidates_to_check.append((last_cycle["token_id"], last_cycle["bucket_low"], last_cycle["bucket_high"]))
+                    for o in outcomes:
+                        if o.get("token_id") and (not candidates_to_check or o["token_id"] != candidates_to_check[0][0]):
+                            candidates_to_check.append((o["token_id"], o["range"][0], o["range"][1]))
+
+                    for tid, t_low, t_high in candidates_to_check:
+                        onchain = get_token_balance(tid)
                         if onchain >= 1.0:
-                            matching = next((o for o in outcomes if o.get("token_id") == last_cycle["token_id"]), None)
-                            cp = matching["price"] if matching else last_cycle.get("exit_price", last_cycle["entry_price"])
-                            real_entry = get_real_entry_price(last_cycle["token_id"])
-                            entry = real_entry if real_entry is not None else cp
-                            cycle_num = len(cycles) + 1
-                            print(f"  [RECONCILE] {loc['name']} {date} [C{cycle_num}] — {onchain:.1f} orphaned shares on-chain "
-                                  f"(entry ${entry:.4f}, market ${cp:.3f})")
+                            matching = next((o for o in outcomes if o.get("token_id") == tid), None)
+                            cp       = matching["price"] if matching else (last_cycle["entry_price"] if last_cycle else 0.5)
+                            real_entry = get_real_entry_price(tid)
+                            entry      = real_entry if real_entry is not None else cp
+                            cycle_num  = len(cycles) + 1
+                            print(f"  [RECONCILE] {loc['name']} {date} [C{cycle_num}] — "
+                                  f"{onchain:.1f} orphaned shares ({t_low}-{t_high}{unit_sym}) "
+                                  f"entry ${entry:.4f}, market ${cp:.3f}")
                             mkt["cycles"].append({
                                 "cycle_num":          cycle_num,
-                                "market_id":          last_cycle["market_id"],
-                                "token_id":           last_cycle["token_id"],
-                                "question":           last_cycle.get("question"),
-                                "bucket_low":         last_cycle["bucket_low"],
-                                "bucket_high":        last_cycle["bucket_high"],
+                                "market_id":          last_cycle["market_id"] if last_cycle else (matching["market_id"] if matching else ""),
+                                "token_id":           tid,
+                                "question":           last_cycle.get("question") if last_cycle else (matching["question"] if matching else ""),
+                                "bucket_low":         t_low,
+                                "bucket_high":        t_high,
                                 "entry_price":        entry,
                                 "shares":             round(onchain, 2),
                                 "cost":               round(onchain * entry, 2),
@@ -934,8 +1108,8 @@ def scan_and_update():
                                 "kelly":              None,
                                 "forecast_temp":      forecast_temp,
                                 "forecast_src":       best_source,
-                                "sigma":              None,
-                                "opened_at":          snap.get("ts"),
+                                "sigma":              sigma,
+                                "opened_at":          ts_now,
                                 "status":             "open",
                                 "pnl":                None,
                                 "exit_price":         None,
@@ -946,271 +1120,240 @@ def scan_and_update():
                                 "trailing_activated": False,
                                 "reconciled":         True,
                             })
-                    else:
-                        for o in outcomes:
-                            tid = o.get("token_id")
-                            if not tid:
-                                continue
-                            onchain = get_token_balance(tid)
-                            if onchain >= 1.0:
-                                cp = o["price"]
-                                t_low, t_high = o["range"]
-                                real_entry = get_real_entry_price(tid)
-                                entry = real_entry if real_entry is not None else cp
-                                cycle_num = len(mkt.get("cycles", [])) + 1
-                                print(f"  [RECONCILE] {loc['name']} {date} [C{cycle_num}] — {onchain:.1f} on-chain shares "
-                                      f"({t_low}-{t_high}{unit_sym}) entry ${entry:.4f}, market ${cp:.3f}")
-                                mkt["cycles"].append({
-                                    "cycle_num":          cycle_num,
-                                    "market_id":          o["market_id"],
-                                    "token_id":           tid,
-                                    "question":           o["question"],
-                                    "bucket_low":         t_low,
-                                    "bucket_high":        t_high,
-                                    "entry_price":        entry,
-                                    "shares":             round(onchain, 2),
-                                    "cost":               round(onchain * entry, 2),
-                                    "p":                  None,
-                                    "ev":                 None,
-                                    "kelly":              None,
-                                    "forecast_temp":      forecast_temp,
-                                    "forecast_src":       best_source,
-                                    "sigma":              None,
-                                    "opened_at":          snap.get("ts"),
-                                    "status":             "open",
-                                    "pnl":                None,
-                                    "exit_price":         None,
-                                    "close_reason":       None,
-                                    "closed_at":          None,
-                                    "order_id":           None,
-                                    "stop_price":         round(entry * STOP_LOSS_PCT, 4),
-                                    "trailing_activated": False,
-                                    "reconciled":         True,
-                                })
-                                break
-                            time.sleep(0.05)
+                            break
+                        time.sleep(0.05)
 
-            # --- STOP-LOSS, TRAILING STOP, AND TAKE-PROFIT ---
+            # ---- STOP-LOSS / TAKE-PROFIT ----
             pos = get_active_cycle(mkt)
             if pos is not None:
-                current_price = None
-                for o in outcomes:
-                    if o["market_id"] == pos["market_id"]:
-                        current_price = o["price"]
-                        break
-
+                current_price = next(
+                    (o["price"] for o in outcomes if o["market_id"] == pos["market_id"]),
+                    None
+                )
                 if current_price is not None:
-                    entry = pos["entry_price"]
-                    stop  = pos.get("stop_price", entry * STOP_LOSS_PCT)
+                    entry         = pos["entry_price"]
+                    stop          = pos.get("stop_price", entry * STOP_LOSS_PCT)
+                    roi_threshold = entry * (1.0 + _strategy["take_profit_roi"])
 
+                    # Raise stop to breakeven once we're up 20%
                     if current_price >= entry * 1.20 and stop < entry:
-                        pos["stop_price"] = entry
+                        pos["stop_price"]         = entry
                         pos["trailing_activated"] = True
 
-                    if hours < 24:
-                        take_profit = TAKE_PROFIT_FINAL
-                    elif hours < 48:
-                        take_profit = TAKE_PROFIT_SHORT
-                    else:
-                        take_profit = TAKE_PROFIT_LONG
-
-                    roi_threshold = entry * (1.0 + TAKE_PROFIT_ROI)
-                    # Guard: only take profit if current price is above entry — never exit at a loss
-                    # via a take_profit threshold (stop_loss handles downside protection)
-                    take_triggered = (current_price >= take_profit or current_price >= roi_threshold) and current_price > entry
+                    take_triggered = current_price >= roi_threshold and current_price > entry
                     stop_triggered = current_price <= stop
 
                     if take_triggered or stop_triggered:
                         onchain = get_token_balance(pos["token_id"])
                         if onchain < 1.0:
-                            pnl = round((current_price - entry) * pos["shares"], 2)
+                            # Already sold externally
+                            reason = "sold_externally"
+                            pnl    = round((current_price - entry) * pos["shares"], 2)
                             pos["exit_price"]   = current_price
                             pos["pnl"]          = pnl
                             pos["status"]       = "closed"
-                            pos["close_reason"] = "sold_externally"
-                            pos["closed_at"]    = snap.get("ts")
+                            pos["close_reason"] = reason
+                            pos["closed_at"]    = ts_now
                             closed += 1
                             state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
                             if pnl > 0:
                                 state["profitable_exits"] = state.get("profitable_exits", 0) + 1
                             else:
                                 state["losing_exits"] = state.get("losing_exits", 0) + 1
-                            print(f"  [CLOSED] {loc['name']} {date} — 0 shares on-chain, position already sold/resolved")
+                            print(f"  [CLOSED] {loc['name']} {date} — 0 on-chain, already sold")
                         else:
                             resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
                             if resp is not None:
-                                pnl = round((current_price - entry) * pos["shares"], 2)
-                                balance += pos["cost"] + pnl
-                                pos["closed_at"]    = snap.get("ts")
-                                if current_price >= roi_threshold and current_price < take_profit:
-                                    pos["close_reason"] = "take_profit_roi"
-                                    reason = "TAKE ROI"
-                                elif take_triggered:
-                                    pos["close_reason"] = "take_profit"
-                                    reason = "TAKE"
+                                if take_triggered:
+                                    reason = "take_profit_roi"
+                                    label  = "TAKE ROI"
                                 elif current_price < entry:
-                                    pos["close_reason"] = "stop_loss"
-                                    reason = "STOP"
+                                    reason = "stop_loss"
+                                    label  = "STOP"
                                 else:
-                                    pos["close_reason"] = "trailing_stop"
-                                    reason = "TRAILING BE"
+                                    reason = "trailing_stop"
+                                    label  = "TRAILING BE"
+                                pnl      = round((current_price - entry) * pos["shares"], 2)
+                                balance += pos["cost"] + pnl
                                 pos["exit_price"]   = current_price
                                 pos["pnl"]          = pnl
                                 pos["status"]       = "closed"
-                                closed += 1
+                                pos["close_reason"] = reason
+                                pos["closed_at"]    = ts_now
                                 state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
                                 if pnl > 0:
                                     state["profitable_exits"] = state.get("profitable_exits", 0) + 1
                                 else:
                                     state["losing_exits"] = state.get("losing_exits", 0) + 1
-                                print(f"  [{reason}] {loc['name']} {date} [C{pos['cycle_num']}] | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                                closed += 1
+                                print(f"  [{label}] {loc['name']} {date} [C{pos['cycle_num']}] | "
+                                      f"entry ${entry:.3f} exit ${current_price:.3f} | "
+                                      f"PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
                             else:
                                 print(f"  [SELL FAIL] {loc['name']} {date} — will retry next cycle")
 
-            # --- CLOSE POSITION if forecast shifted 2+ degrees ---
+            # ---- FORECAST SHIFT EXIT ----
+            # Exit when the updated forecast drops the held bucket's probability
+            # below the entry confidence threshold (with a 5% hysteresis buffer).
+            # Uses bucket_prob() so bounded, upper-unbounded, and lower-unbounded
+            # buckets are all handled correctly.
             pos = get_active_cycle(mkt)
             if pos is not None and forecast_temp is not None:
-                old_bucket_low  = pos["bucket_low"]
-                old_bucket_high = pos["bucket_high"]
-                buffer = 2.0 if unit == "F" else 1.0
-                mid_bucket = (old_bucket_low + old_bucket_high) / 2 if old_bucket_low != -999 and old_bucket_high != 999 else forecast_temp
-                forecast_far = abs(forecast_temp - mid_bucket) > (abs(mid_bucket - old_bucket_low) + buffer)
-                if not in_bucket(forecast_temp, old_bucket_low, old_bucket_high) and forecast_far:
-                    current_price = None
-                    for o in outcomes:
-                        if o["market_id"] == pos["market_id"]:
-                            current_price = o["price"]
-                            break
+                t_low   = pos["bucket_low"]
+                t_high  = pos["bucket_high"]
+                entry_p = pos.get("p") or 0.0
+                new_p   = bucket_prob(forecast_temp, t_low, t_high, sigma)
+                # Exit if probability dropped >30% from entry level, or below hard floor.
+                # Using a relative drop avoids the absolute-threshold issue for narrow buckets
+                # (e.g., 1°C EU buckets max out at ~32%, so a fixed 0.45 threshold would
+                # always fire).
+                shifted = new_p < 0.10 or (entry_p > 0 and new_p < entry_p * 0.70)
+                if shifted:
+                    current_price = next(
+                        (o["price"] for o in outcomes if o["market_id"] == pos["market_id"]),
+                        None
+                    )
                     if current_price is not None:
                         resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
                         if resp is not None:
-                            pnl = round((current_price - pos["entry_price"]) * pos["shares"], 2)
-                            balance += pos["cost"] + pnl
-                            pos["closed_at"]    = snap.get("ts")
-                            pos["close_reason"] = "forecast_changed"
+                            entry    = pos["entry_price"]
+                            entry_p  = pos.get("p") or 0.0
+                            pnl      = round((current_price - entry) * pos["shares"], 2)
                             pos["exit_price"]   = current_price
                             pos["pnl"]          = pnl
                             pos["status"]       = "closed"
+                            pos["close_reason"] = "forecast_changed"
+                            pos["closed_at"]    = ts_now
                             closed += 1
                             state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
                             if pnl > 0:
                                 state["profitable_exits"] = state.get("profitable_exits", 0) + 1
                             else:
                                 state["losing_exits"] = state.get("losing_exits", 0) + 1
-                            print(f"  [CLOSE] {loc['name']} {date} [C{pos['cycle_num']}] — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                            print(f"  [FORECAST] {loc['name']} {date} [C{pos['cycle_num']}] — "
+                                  f"p={entry_p:.0%}→{new_p:.0%} (fc {pos.get('forecast_temp')}→{forecast_temp}{unit}) | "
+                                  f"PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
                         else:
                             print(f"  [SELL FAIL] {loc['name']} {date} — will retry next cycle")
 
-            # --- OPEN POSITION (multi-bucket scan) ---
-            best_signal = None
-            _active = get_active_cycle(mkt)
-            _completed = mkt.get("cycles", [])
-            _last_profitable = True  # first entry always allowed
-            if _completed:
-                _last_pnl = _completed[-1].get("pnl")
-                _last_profitable = _last_pnl is not None and _last_pnl > 0
-            if (_active is None and len(_completed) < MAX_CYCLES_PER_MARKET
-                    and _last_profitable and forecast_temp is not None and hours >= MIN_HOURS):
-                sigma = snap.get("best_sigma") or get_sigma(city_slug, best_source or "ecmwf", horizon=i)
+            # ---- OPEN POSITION ----
+            pos        = get_active_cycle(mkt)
+            cycles_all = mkt.get("cycles", [])
 
-                all_open = load_all_markets()
-                total_open = sum(1 for m in all_open if get_active_cycle(m) is not None)
-                date_open = sum(1 for m in all_open if get_active_cycle(m) is not None and m["date"] == date)
+            if pos is None and len(cycles_all) < MAX_CYCLES and hours >= MIN_HOURS:
+                # Portfolio-level caps
+                all_mkts   = load_all_markets()
+                total_open = sum(1 for m in all_mkts if get_active_cycle(m) is not None)
+                date_open  = sum(1 for m in all_mkts if get_active_cycle(m) is not None and m["date"] == date)
+                if total_open >= MAX_OPEN_POS or date_open >= MAX_POS_PER_DATE:
+                    save_market(mkt)
+                    time.sleep(0.1)
+                    continue
 
-                skip_portfolio = False
-                if total_open >= MAX_OPEN_POS:
-                    skip_portfolio = True
-                elif date_open >= MAX_POS_PER_DATE:
-                    skip_portfolio = True
+                candidate = None
 
-                if not skip_portfolio:
-                    candidates = []
-                    for o in outcomes:
-                        t_low, t_high = o["range"]
-                        if o["volume"] < MIN_VOLUME:
-                            continue
-                        p = bucket_prob(forecast_temp, t_low, t_high, sigma)
-                        if p < 0.01:
-                            continue
-                        yes_price = o["price"]
-                        if yes_price < MIN_PRICE:
-                            continue
-                        ev = calc_ev(p, yes_price)
-                        if ev >= _strategy["min_ev"]:
-                            kelly = calc_kelly(p, yes_price)
-                            size = bet_size(kelly, balance)
-                            if size >= MIN_BET:
-                                candidates.append({
-                                    "market_id":    o["market_id"],
-                                    "token_id":     o["token_id"],
-                                    "question":     o["question"],
-                                    "bucket_low":   t_low,
-                                    "bucket_high":  t_high,
-                                    "entry_price":  yes_price,
-                                    "shares":       round(size / yes_price, 2),
-                                    "cost":         size,
-                                    "p":            round(p, 4),
-                                    "ev":           round(ev, 4),
-                                    "kelly":        round(kelly, 4),
-                                    "forecast_temp":forecast_temp,
-                                    "forecast_src": best_source,
-                                    "sigma":        sigma,
-                                    "opened_at":    snap.get("ts"),
-                                    "status":       "open",
-                                    "pnl":          None,
-                                    "exit_price":   None,
-                                    "close_reason": None,
-                                    "closed_at":    None,
-                                    "order_id":     None,
-                                })
+                if not cycles_all:
+                    # First entry: find highest-probability bucket in the opportunity zone
+                    candidate = find_best_entry(
+                        outcomes, forecast_temp, sigma, balance, mkt
+                    )
+                else:
+                    # Re-entry: evaluate risk gates on the same bucket
+                    reentry = evaluate_reentry(cycles_all, outcomes, forecast_temp, sigma, hours)
+                    if reentry is not None and reentry["volume"] >= MIN_VOLUME:
+                        price  = reentry["price"]
+                        p      = reentry["p"]
+                        kelly  = calc_kelly(p, price)
+                        # Cap size at cycle 1's original cost (no escalating bets)
+                        max_size = cycles_all[0].get("cost", MAX_BET)
+                        size   = min(bet_size(kelly, balance), max_size)
+                        if size >= MIN_BET:
+                            candidate = {
+                                "market_id":    reentry["market_id"],
+                                "token_id":     reentry["token_id"],
+                                "question":     reentry["question"],
+                                "bucket_low":   reentry["bucket_low"],
+                                "bucket_high":  reentry["bucket_high"],
+                                "entry_price":  price,
+                                "shares":       round(size / price, 2),
+                                "cost":         size,
+                                "p":            p,
+                                "ev":           round(calc_ev(p, price), 4),
+                                "kelly":        round(kelly, 4),
+                            }
 
-                    candidates.sort(key=lambda c: c["ev"], reverse=True)
-                    best_signal = candidates[0] if candidates else None
-
-                if best_signal:
-                    skip_position = False
+                if candidate is not None:
+                    # Confirm real ask / spread before placing
+                    skip = False
                     try:
-                        r = requests.get(f"https://gamma-api.polymarket.com/markets/{best_signal['market_id']}", timeout=(3, 5))
+                        r     = requests.get(
+                            f"https://gamma-api.polymarket.com/markets/{candidate['market_id']}",
+                            timeout=(3, 5)
+                        )
                         mdata = r.json()
-                        real_ask = float(mdata.get("bestAsk", best_signal["entry_price"]))
-                        real_bid = float(mdata.get("bestBid", best_signal["entry_price"]))
+                        real_ask    = float(mdata.get("bestAsk", candidate["entry_price"]))
+                        real_bid    = float(mdata.get("bestBid", candidate["entry_price"]))
                         real_spread = round(real_ask - real_bid, 4)
-                        if real_spread > MAX_SLIPPAGE or real_ask >= _strategy["max_price"] or real_ask < MIN_PRICE:
-                            print(f"  [SKIP] {loc['name']} {date} — real ask ${real_ask:.3f} spread ${real_spread:.3f}")
-                            skip_position = True
+                        if real_spread > MAX_SLIPPAGE or real_ask > MAX_ENTRY_PRICE or real_ask < MIN_ENTRY_PRICE:
+                            print(f"  [SKIP] {loc['name']} {date} — ask ${real_ask:.3f} spread ${real_spread:.3f}")
+                            skip = True
                         else:
-                            best_signal["entry_price"]  = real_ask
-                            best_signal["shares"]       = round(best_signal["cost"] / real_ask, 2)
-                            best_signal["ev"]           = round(calc_ev(best_signal["p"], real_ask), 4)
+                            candidate["entry_price"] = real_ask
+                            candidate["shares"]      = round(candidate["cost"] / real_ask, 2)
+                            candidate["ev"]          = round(calc_ev(candidate["p"], real_ask), 4)
                     except Exception as e:
-                        print(f"  [WARN] Could not fetch real ask for {best_signal['market_id']}: {e}")
+                        print(f"  [WARN] Could not fetch real ask: {e}")
 
-                    if not skip_position and best_signal["entry_price"] < _strategy["max_price"]:
-                        if not best_signal["token_id"]:
-                            print(f"  [SKIP] {loc['name']} {date} — no token_id, cannot place order")
+                    if not skip:
+                        if not candidate.get("token_id"):
+                            print(f"  [SKIP] {loc['name']} {date} — no token_id")
                         else:
-                            existing = get_token_balance(best_signal["token_id"])
+                            existing = get_token_balance(candidate["token_id"])
                             if existing >= 1.0:
-                                print(f"  [SKIP] {loc['name']} {date} — already hold {existing:.1f} shares on-chain")
+                                print(f"  [SKIP] {loc['name']} {date} — already hold {existing:.1f} shares")
                             else:
-                                resp = place_buy_order(best_signal["token_id"], best_signal["cost"])
+                                resp = place_buy_order(candidate["token_id"], candidate["cost"])
                                 if resp is not None:
-                                    best_signal["order_id"]           = resp.get("orderID", resp.get("orderId", ""))
-                                    best_signal["cycle_num"]          = len(mkt["cycles"]) + 1
-                                    best_signal["stop_price"]         = round(best_signal["entry_price"] * STOP_LOSS_PCT, 4)
-                                    best_signal["trailing_activated"] = False
-                                    balance -= best_signal["cost"]
-                                    mkt["cycles"].append(best_signal)
+                                    cycle_num = len(mkt["cycles"]) + 1
+                                    bucket_label = f"{candidate['bucket_low']}-{candidate['bucket_high']}{unit_sym}"
+                                    entry_type   = "RE-ENTRY" if cycles_all else "BUY"
+                                    mkt["cycles"].append({
+                                        "cycle_num":          cycle_num,
+                                        "market_id":          candidate["market_id"],
+                                        "token_id":           candidate["token_id"],
+                                        "question":           candidate["question"],
+                                        "bucket_low":         candidate["bucket_low"],
+                                        "bucket_high":        candidate["bucket_high"],
+                                        "entry_price":        candidate["entry_price"],
+                                        "shares":             candidate["shares"],
+                                        "cost":               candidate["cost"],
+                                        "p":                  candidate["p"],
+                                        "ev":                 candidate["ev"],
+                                        "kelly":              candidate["kelly"],
+                                        "forecast_temp":      forecast_temp,
+                                        "forecast_src":       best_source,
+                                        "sigma":              sigma,
+                                        "opened_at":          ts_now,
+                                        "status":             "open",
+                                        "pnl":                None,
+                                        "exit_price":         None,
+                                        "close_reason":       None,
+                                        "closed_at":          None,
+                                        "order_id":           resp.get("orderID", resp.get("orderId", "")),
+                                        "stop_price":         round(candidate["entry_price"] * STOP_LOSS_PCT, 4),
+                                        "trailing_activated": False,
+                                        "reconciled":         False,
+                                    })
+                                    balance -= candidate["cost"]
                                     state["total_trades"] += 1
                                     new_pos += 1
-                                    bucket_label = f"{best_signal['bucket_low']}-{best_signal['bucket_high']}{unit_sym}"
-                                    print(f"  [BUY]  {loc['name']} {horizon} {date} [C{best_signal['cycle_num']}] | {bucket_label} | "
-                                          f"${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f} | "
-                                          f"${best_signal['cost']:.2f} ({(best_signal['forecast_src'] or 'blend').upper()})")
+                                    print(f"  [{entry_type}] {loc['name']} {horizon} {date} [C{cycle_num}] | "
+                                          f"{bucket_label} | ${candidate['entry_price']:.3f} | "
+                                          f"P={candidate['p']:.0%} EV={candidate['ev']:+.2f} | "
+                                          f"${candidate['cost']:.2f} ({(best_source or 'blend').upper()})")
                                 else:
-                                    print(f"  [ORDER FAIL] {loc['name']} {date} — order not filled")
+                                    print(f"  [ORDER FAIL] {loc['name']} {date}")
 
-            # Market closed by time
             if hours < 0.5 and mkt["status"] == "open":
                 mkt["status"] = "closed"
 
@@ -1219,27 +1362,24 @@ def scan_and_update():
 
         print("ok")
 
-    # --- AUTO-RESOLUTION ---
+    # ---- AUTO-RESOLUTION ----
     for mkt in load_all_markets():
         if mkt["status"] == "resolved":
             continue
-
         pos = get_active_cycle(mkt)
         if pos is None:
             continue
-
         market_id = pos.get("market_id")
         if not market_id:
             continue
 
         won, closed_at_str = check_market_resolved(market_id)
-
         if won is None:
             if closed_at_str:
                 try:
                     closed_dt = datetime.fromisoformat(closed_at_str.replace("Z", "+00:00"))
                     if (now - closed_dt).total_seconds() > 48 * 3600:
-                        print(f"  [TIMEOUT] {mkt['city_name']} {mkt['date']} — indeterminate after 48h, skipping")
+                        print(f"  [TIMEOUT] {mkt['city_name']} {mkt['date']} — indeterminate after 48h")
                         mkt["status"] = "unresolvable"
                         save_market(mkt)
                 except Exception:
@@ -1247,9 +1387,9 @@ def scan_and_update():
             continue
 
         price  = pos["entry_price"]
-        size   = pos["cost"]
         shares = pos["shares"]
-        pnl    = round(shares * (1 - price), 2) if won else round(-size, 2)
+        cost   = pos["cost"]
+        pnl    = round(shares * (1 - price), 2) if won else round(-cost, 2)
 
         pos["exit_price"]   = 1.0 if won else 0.0
         pos["pnl"]          = pnl
@@ -1269,7 +1409,6 @@ def scan_and_update():
             state["resolved_wins"]   = state.get("resolved_wins", 0) + 1
         else:
             state["resolved_losses"] = state.get("resolved_losses", 0) + 1
-
         state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
         if pnl > 0:
             state["profitable_exits"] = state.get("profitable_exits", 0) + 1
@@ -1279,11 +1418,10 @@ def scan_and_update():
         result = "WIN" if won else "LOSS"
         print(f"  [{result}] {mkt['city_name']} {mkt['date']} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
         resolved += 1
-
         save_market(mkt)
         time.sleep(0.3)
 
-    # --- BACKFILL actual_temp FOR ALL PAST MARKETS (calibration needs this) ---
+    # ---- BACKFILL actual_temp for calibration ----
     if VC_KEY_VALID:
         for mkt in load_all_markets():
             if mkt.get("actual_temp") is not None:
@@ -1305,268 +1443,47 @@ def scan_and_update():
     state["peak_balance"] = max(state.get("peak_balance", balance), state["balance"])
     save_state(state)
 
-    all_mkts = load_all_markets()
-    global _cal
-    _cal = run_calibration(all_mkts)
-
+    _cal = run_calibration(load_all_markets())
     if TUNE_ENABLED:
-        tune_strategy(all_mkts, state)
+        tune_strategy(load_all_markets())
 
     return new_pos, closed, resolved
 
 # =============================================================================
-# STRATEGY TUNING
+# MONITOR POSITIONS  (quick between-scan check)
 # =============================================================================
-
-_TUNE_BOUNDS = {
-    "kelly_fraction": (0.10, 0.60),
-    "min_ev":         (0.03, 0.30),
-    "max_price":      (0.25, 0.62),
-}
-_TUNE_MAX_STEP = 0.10
-
-def tune_strategy(markets, state):
-    """Adjust strategy parameters based on recent closed cycles."""
-    # Pool A: ALL closed cycles from any market — strategy profitability signal.
-    # Early exits (stop_loss, take_profit, forecast_changed) are valid signal for
-    # ev_bands and price_bands because their PnL tells us whether the entry was worth making.
-    all_closed = [
-        (m, c) for m in markets
-        for c in m.get("cycles", [])
-        if c.get("pnl") is not None
-    ]
-    all_closed.sort(key=lambda x: x[1].get("closed_at", ""))
-    recent_pairs = all_closed[-TUNE_LOOKBACK:] if len(all_closed) >= 20 else []
-    if not recent_pairs:
-        return
-
-    old = dict(_strategy)
-
-    # Pool B: cycles where Polymarket resolved the market — model accuracy signal only.
-    # Restricted to close_reason == "resolved" so early exits don't dilute the kelly signal.
-    # Source is recent_pairs (already time-sorted slice) for consistency.
-    resolved_only = [(m, c) for m, c in recent_pairs if c.get("close_reason") == "resolved"]
-    if resolved_only:
-        kelly_wins      = sum(1 for _, c in resolved_only if (c.get("pnl") or 0) > 0)
-        actual_wr       = kelly_wins / len(resolved_only)
-        avg_predicted_p = sum(c.get("p", 0.5) for _, c in resolved_only) / len(resolved_only)
-
-        if actual_wr > avg_predicted_p + 0.05:
-            adj = min(0.02, _TUNE_MAX_STEP * _strategy["kelly_fraction"])
-            _strategy["kelly_fraction"] = min(_strategy["kelly_fraction"] + adj, _TUNE_BOUNDS["kelly_fraction"][1])
-        elif actual_wr < avg_predicted_p - 0.05:
-            adj = min(0.02, _TUNE_MAX_STEP * _strategy["kelly_fraction"])
-            _strategy["kelly_fraction"] = max(_strategy["kelly_fraction"] - adj, _TUNE_BOUNDS["kelly_fraction"][0])
-    # if no resolved cycles in pool, kelly stays unchanged — no signal yet
-
-    ev_bands = [(0.03, []), (0.05, []), (0.08, []), (0.10, []), (0.15, []), (0.20, [])]
-    for _, c in recent_pairs:
-        pos_ev = c.get("ev", 0)
-        for threshold, group in ev_bands:
-            if pos_ev >= threshold:
-                group.append(c.get("pnl", 0) or 0)
-
-    best_ev_threshold = _strategy["min_ev"]
-    best_ev_pnl_ratio = None
-    for threshold, pnls in ev_bands:
-        if len(pnls) >= 5:
-            ratio = sum(pnls) / len(pnls)
-            if best_ev_pnl_ratio is None or ratio > best_ev_pnl_ratio:
-                best_ev_pnl_ratio = ratio
-                best_ev_threshold = threshold
-
-    current = _strategy["min_ev"]
-    delta = best_ev_threshold - current
-    capped = max(-_TUNE_MAX_STEP * current, min(_TUNE_MAX_STEP * current, delta))
-    _strategy["min_ev"] = round(max(_TUNE_BOUNDS["min_ev"][0], min(_TUNE_BOUNDS["min_ev"][1], current + capped)), 4)
-
-    price_bands = [(0.25, []), (0.30, []), (0.35, []), (0.40, []), (0.45, []), (0.55, []), (0.65, [])]
-    for _, c in recent_pairs:
-        ep = c.get("entry_price", 0)
-        for ceiling, group in price_bands:
-            if ep <= ceiling:
-                group.append(c.get("pnl", 0) or 0)
-
-    best_price_ceil  = _strategy["max_price"]
-    best_price_ratio = None
-    for ceiling, pnls in price_bands:
-        if len(pnls) >= 5:
-            ratio = sum(pnls) / len(pnls)
-            if best_price_ratio is None or ratio > best_price_ratio:
-                best_price_ratio = ratio
-                best_price_ceil  = ceiling
-
-    current = _strategy["max_price"]
-    delta = best_price_ceil - current
-    capped = max(-_TUNE_MAX_STEP * current, min(_TUNE_MAX_STEP * current, delta))
-    _strategy["max_price"] = round(max(_TUNE_BOUNDS["max_price"][0], min(_TUNE_BOUNDS["max_price"][1], current + capped)), 4)
-
-    changes = []
-    for k in ("min_ev", "max_price", "kelly_fraction"):
-        if abs(_strategy[k] - old[k]) > 0.001:
-            changes.append(f"{k}: {old[k]:.3f}->{_strategy[k]:.3f}")
-
-    if changes:
-        print(f"  [TUNE] {', '.join(changes)}")
-        try:
-            STRATEGY_FILE.write_text(json.dumps(_strategy, indent=2), encoding="utf-8")
-        except Exception as e:
-            print(f"  [TUNE] Failed to save: {e}")
-
-# =============================================================================
-# REPORT
-# =============================================================================
-
-def print_status():
-    state    = load_state()
-    markets  = load_all_markets()
-    open_pos = [m for m in markets if get_active_cycle(m) is not None]
-
-    bal     = state["balance"]
-    start   = state["starting_balance"]
-    ret_pct = (bal - start) / start * 100
-    prof    = state.get("profitable_exits", 0)
-    loss_e  = state.get("losing_exits", 0)
-    r_wins  = state.get("resolved_wins", 0)
-    r_loss  = state.get("resolved_losses", 0)
-    net_pnl = state.get("net_pnl", 0.0)
-    total   = prof + loss_e
-    r_total = r_wins + r_loss
-
-    # Also show live on-chain balance
-    real_bal = get_real_balance()
-    real_str = f"  On-chain USDC: ${real_bal:,.2f}" if real_bal is not None else "  On-chain USDC: (unavailable)"
-
-    print(f"\n{'='*55}")
-    print(f"  WEATHERBET v3 — STATUS (REAL TRADES)")
-    print(f"{'='*55}")
-    print(f"  Balance:     ${bal:,.2f}  (start ${start:,.2f}, {'+'if ret_pct>=0 else ''}{ret_pct:.1f}%)")
-    print(real_str)
-    if total:
-        pnl_str = f"{'+'if net_pnl>=0 else ''}{net_pnl:.2f}"
-        wr_str  = f"{prof/total:.0%}"
-        print(f"  Exits:       {total} | Profitable: {prof} | Losing: {loss_e} | WR: {wr_str} | Net PnL: {pnl_str}")
-    else:
-        print(f"  Exits:       none yet")
-    if r_total:
-        print(f"  Resolved:    {r_total} | W: {r_wins} | L: {r_loss} | WR: {r_wins/r_total:.0%}")
-    else:
-        print(f"  Resolved:    none yet")
-    print(f"  Open:        {len(open_pos)}")
-
-    if open_pos:
-        print(f"\n  Open positions:")
-        total_unrealized = 0.0
-        for m in open_pos:
-            pos      = get_active_cycle(m)
-            unit_sym = "F" if m["unit"] == "F" else "C"
-            label    = f"{pos['bucket_low']}-{pos['bucket_high']}{unit_sym} [C{pos['cycle_num']}]"
-
-            current_price = pos["entry_price"]
-            for o in m.get("all_outcomes", []):
-                if o["market_id"] == pos["market_id"]:
-                    current_price = o["price"]
-                    break
-
-            unrealized = round((current_price - pos["entry_price"]) * pos["shares"], 2)
-            total_unrealized += unrealized
-            pnl_str = f"{'+'if unrealized>=0 else ''}{unrealized:.2f}"
-
-            print(f"    {m['city_name']:<16} {m['date']} | {label:<20} | "
-                  f"entry ${pos['entry_price']:.3f} -> ${current_price:.3f} | "
-                  f"PnL: {pnl_str} | {(pos.get('forecast_src') or 'blend').upper()}")
-
-        sign = "+" if total_unrealized >= 0 else ""
-        print(f"\n  Unrealized PnL: {sign}{total_unrealized:.2f}")
-
-    print(f"{'='*55}\n")
-
-def print_report():
-    markets  = load_all_markets()
-    resolved = [m for m in markets if m["status"] == "resolved" and m.get("pnl") is not None]
-
-    print(f"\n{'='*55}")
-    print(f"  WEATHERBET v3 — FULL REPORT")
-    print(f"{'='*55}")
-
-    if not resolved:
-        print("  No resolved markets yet.")
-        return
-
-    total_pnl = sum(m["pnl"] for m in resolved)
-    wins      = [m for m in resolved if m["resolved_outcome"] == "win"]
-    losses    = [m for m in resolved if m["resolved_outcome"] == "loss"]
-
-    print(f"\n  Total resolved: {len(resolved)}")
-    print(f"  Wins:           {len(wins)} | Losses: {len(losses)}")
-    print(f"  Win rate:       {len(wins)/len(resolved):.0%}")
-    print(f"  Total PnL:      {'+'if total_pnl>=0 else ''}{total_pnl:.2f}")
-
-    print(f"\n  By city:")
-    for city in sorted(set(m["city"] for m in resolved)):
-        group = [m for m in resolved if m["city"] == city]
-        w     = len([m for m in group if m["resolved_outcome"] == "win"])
-        pnl   = sum(m["pnl"] for m in group)
-        name  = LOCATIONS[city]["name"]
-        print(f"    {name:<16} {w}/{len(group)} ({w/len(group):.0%})  PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
-
-    print(f"\n  Market details:")
-    for m in sorted(resolved, key=lambda x: x["date"]):
-        unit_sym = "F" if m["unit"] == "F" else "C"
-        snaps    = m.get("forecast_snapshots", [])
-        first_fc = snaps[0]["best"] if snaps else None
-        last_fc  = snaps[-1]["best"] if snaps else None
-        result   = m["resolved_outcome"].upper()
-        mkt_pnl  = f"{'+'if (m['pnl'] or 0)>=0 else ''}{m['pnl']:.2f}" if m["pnl"] is not None else "-"
-        fc_str   = f"forecast {first_fc}->{last_fc}{unit_sym}" if first_fc else "no forecast"
-        actual   = f"actual {m['actual_temp']}{unit_sym}" if m["actual_temp"] else ""
-        cycles   = m.get("cycles", [])
-        if cycles:
-            for c in cycles:
-                label   = f"{c.get('bucket_low')}-{c.get('bucket_high')}{unit_sym} C{c['cycle_num']}"
-                c_pnl   = f"{'+'if (c.get('pnl') or 0)>=0 else ''}{(c.get('pnl') or 0):.2f}"
-                reason  = c.get("close_reason", "?")
-                print(f"    {m['city_name']:<16} {m['date']} | {label:<18} | {fc_str} | {actual} | {result} {c_pnl} ({reason})")
-        else:
-            print(f"    {m['city_name']:<16} {m['date']} | no cycles       | {fc_str} | {actual} | {result} {mkt_pnl}")
-
-    print(f"{'='*55}\n")
-
-# =============================================================================
-# MAIN LOOP
-# =============================================================================
-
-# MONITOR_INTERVAL is now read from config above
 
 def monitor_positions():
-    """Quick stop check on open positions without full scan."""
+    """
+    Quick check of open positions for stop-loss and take-profit.
+    Also reconciles orphaned on-chain shares between full scans.
+    """
     markets  = load_all_markets()
     open_pos = [m for m in markets if get_active_cycle(m) is not None]
 
-    # Reconcile: check markets with closed cycles for orphaned on-chain shares
-    closed_mkts = [
-        m for m in markets
-        if m.get("cycles") and get_active_cycle(m) is None and m["status"] != "resolved"
-    ]
-    for mkt in closed_mkts:
-        last_cycle = mkt["cycles"][-1]
+    # Reconcile: check markets with closed cycles but no active position
+    for mkt in markets:
+        cycles = mkt.get("cycles", [])
+        if not cycles or get_active_cycle(mkt) is not None or mkt["status"] == "resolved":
+            continue
+        if len(cycles) >= MAX_CYCLES:
+            continue
+        last_cycle = cycles[-1]
         if not last_cycle.get("token_id"):
             continue
-        if len(mkt["cycles"]) >= MAX_CYCLES_PER_MARKET:
-            continue  # cycle limit — don't create more reconciled cycles
         if last_cycle.get("closed_at"):
             try:
                 _lc = datetime.fromisoformat(last_cycle["closed_at"].replace("Z", "+00:00"))
                 if (datetime.now(timezone.utc) - _lc).total_seconds() < 120:
-                    continue  # cooldown — on-chain balance may not have settled yet
+                    continue
             except Exception:
                 pass
         onchain = get_token_balance(last_cycle["token_id"])
         if onchain >= 1.0:
-            city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
+            city_name     = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
             current_price = last_cycle.get("exit_price", last_cycle["entry_price"])
             try:
-                r = requests.get(f"https://gamma-api.polymarket.com/markets/{last_cycle['market_id']}", timeout=(3, 5))
+                r     = requests.get(f"https://gamma-api.polymarket.com/markets/{last_cycle['market_id']}", timeout=(3, 5))
                 mdata = r.json()
                 prices = json.loads(mdata.get("outcomePrices", "[]"))
                 if prices:
@@ -1574,10 +1491,10 @@ def monitor_positions():
             except Exception:
                 pass
             real_entry = get_real_entry_price(last_cycle["token_id"])
-            entry = real_entry if real_entry is not None else current_price
-            cycle_num = len(mkt["cycles"]) + 1
-            print(f"  [RECONCILE] {city_name} {mkt['date']} [C{cycle_num}] — {onchain:.1f} orphaned shares "
-                  f"(entry ${entry:.4f}, market ${current_price:.3f})")
+            entry      = real_entry if real_entry is not None else current_price
+            cycle_num  = len(cycles) + 1
+            print(f"  [RECONCILE] {city_name} {mkt['date']} [C{cycle_num}] — "
+                  f"{onchain:.1f} orphaned shares (entry ${entry:.4f}, market ${current_price:.3f})")
             mkt["cycles"].append({
                 "cycle_num":          cycle_num,
                 "market_id":          last_cycle["market_id"],
@@ -1620,12 +1537,13 @@ def monitor_positions():
         pos = get_active_cycle(mkt)
         if pos is None:
             continue
-        mid = pos["market_id"]
+        mid     = pos["market_id"]
         mutated = False
 
+        # Fetch current best bid
         current_price = None
         try:
-            r = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}", timeout=(3, 5))
+            r     = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}", timeout=(3, 5))
             mdata = r.json()
             best_bid = mdata.get("bestBid")
             if best_bid is not None:
@@ -1642,30 +1560,20 @@ def monitor_positions():
         if current_price is None:
             continue
 
-        entry = pos["entry_price"]
-        stop  = pos.get("stop_price", entry * STOP_LOSS_PCT)
-        city_name = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
+        entry         = pos["entry_price"]
+        stop          = pos.get("stop_price", entry * STOP_LOSS_PCT)
+        roi_threshold = entry * (1.0 + _strategy["take_profit_roi"])
+        city_name     = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
+        ts_now        = datetime.now(timezone.utc).isoformat()
 
-        end_date = mkt.get("event_end_date", "")
-        hours_left = hours_to_resolution(end_date) if end_date else 999.0
-
-        if hours_left < 24:
-            take_profit = TAKE_PROFIT_FINAL
-        elif hours_left < 48:
-            take_profit = TAKE_PROFIT_SHORT
-        else:
-            take_profit = TAKE_PROFIT_LONG
-
+        # Update trailing stop
         if current_price >= entry * 1.20 and stop < entry:
-            pos["stop_price"] = entry
+            pos["stop_price"]         = entry
             pos["trailing_activated"] = True
             mutated = True
-            print(f"  [TRAILING] {city_name} {mkt['date']} — stop moved to breakeven ${entry:.3f}")
+            print(f"  [TRAILING] {city_name} {mkt['date']} — stop raised to breakeven ${entry:.3f}")
 
-        roi_threshold = entry * (1.0 + TAKE_PROFIT_ROI)
-        # Guard: only take profit if current price is above entry — never exit at a loss
-        # via a take_profit threshold (stop_loss handles downside protection)
-        take_triggered = (current_price >= take_profit or current_price >= roi_threshold) and current_price > entry
+        take_triggered = current_price >= roi_threshold and current_price > entry
         stop_triggered = current_price <= stop
 
         if take_triggered or stop_triggered:
@@ -1676,141 +1584,337 @@ def monitor_positions():
                 pos["pnl"]          = pnl
                 pos["status"]       = "closed"
                 pos["close_reason"] = "sold_externally"
-                pos["closed_at"]    = datetime.now(timezone.utc).isoformat()
-                closed += 1
-                mutated = True
+                pos["closed_at"]    = ts_now
+                closed  += 1
+                mutated  = True
                 state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
                 if pnl > 0:
                     state["profitable_exits"] = state.get("profitable_exits", 0) + 1
                 else:
                     state["losing_exits"] = state.get("losing_exits", 0) + 1
-                print(f"  [CLOSED] {city_name} {mkt['date']} — 0 shares on-chain, position already sold/resolved")
+                print(f"  [CLOSED] {city_name} {mkt['date']} — 0 on-chain, already sold")
             else:
-                resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
+                resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=mid)
                 if resp is not None:
-                    pnl = round((current_price - entry) * pos["shares"], 2)
+                    pnl     = round((current_price - entry) * pos["shares"], 2)
                     balance += pos["cost"] + pnl
-                    pos["closed_at"] = datetime.now(timezone.utc).isoformat()
-                    if current_price >= roi_threshold and current_price < take_profit:
-                        pos["close_reason"] = "take_profit_roi"
-                        reason = "TAKE ROI"
-                    elif take_triggered:
-                        pos["close_reason"] = "take_profit"
-                        reason = "TAKE"
+                    if take_triggered:
+                        reason = "take_profit_roi"
+                        label  = "TAKE ROI"
                     elif current_price < entry:
-                        pos["close_reason"] = "stop_loss"
-                        reason = "STOP"
+                        reason = "stop_loss"
+                        label  = "STOP"
                     else:
-                        pos["close_reason"] = "trailing_stop"
-                        reason = "TRAILING BE"
+                        reason = "trailing_stop"
+                        label  = "TRAILING BE"
                     pos["exit_price"]   = current_price
                     pos["pnl"]          = pnl
                     pos["status"]       = "closed"
-                    closed += 1
-                    mutated = True
+                    pos["close_reason"] = reason
+                    pos["closed_at"]    = ts_now
+                    closed  += 1
+                    mutated  = True
                     state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
                     if pnl > 0:
                         state["profitable_exits"] = state.get("profitable_exits", 0) + 1
                     else:
                         state["losing_exits"] = state.get("losing_exits", 0) + 1
-                    print(f"  [{reason}] {city_name} {mkt['date']} [C{pos['cycle_num']}] | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                    print(f"  [{label}] {city_name} {mkt['date']} [C{pos.get('cycle_num')}] | "
+                          f"entry ${entry:.3f} exit ${current_price:.3f} | "
+                          f"PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
                 else:
-                    print(f"  [SELL FAIL] {city_name} {mkt['date']} — will retry next cycle")
+                    print(f"  [SELL FAIL] {city_name} {mkt['date']} — will retry")
 
         if mutated:
             save_market(mkt)
 
     if closed:
         real_bal = get_real_balance()
-        state["balance"] = round(real_bal if real_bal is not None else balance, 2)
+        state["balance"]      = round(real_bal if real_bal is not None else balance, 2)
+        state["peak_balance"] = max(state.get("peak_balance", balance), state["balance"])
         save_state(state)
 
     return closed
 
+# =============================================================================
+# STRATEGY TUNING
+# =============================================================================
 
-def run_loop():
+_TUNE_BOUNDS = {
+    "kelly_fraction":  (0.10, 0.60),
+    "min_confidence":  (0.40, 0.70),
+    "take_profit_roi": (0.20, 0.50),
+}
+_TUNE_MAX_STEP = 0.10
+
+def tune_strategy(markets):
+    """
+    Adjust strategy parameters based on recent closed cycles.
+    Requires at least 20 closed cycles to activate.
+
+    Tunes:
+      kelly_fraction  — win rate vs predicted probability (resolved cycles only)
+      min_confidence  — which confidence band has the best avg PnL
+      take_profit_roi — overall profitable exit rate and stop-loss frequency
+    """
+    all_closed = [
+        (m, c) for m in markets
+        for c in m.get("cycles", [])
+        if c.get("pnl") is not None
+    ]
+    all_closed.sort(key=lambda x: x[1].get("closed_at", ""))
+    recent_pairs = all_closed[-TUNE_LOOKBACK:] if len(all_closed) >= 20 else []
+    if not recent_pairs:
+        return
+
+    old = dict(_strategy)
+
+    # --- kelly_fraction (signal: model accuracy on resolved markets) ---
+    resolved_only = [(m, c) for m, c in recent_pairs if c.get("close_reason") == "resolved"]
+    if resolved_only:
+        kelly_wins      = sum(1 for _, c in resolved_only if (c.get("pnl") or 0) > 0)
+        actual_wr       = kelly_wins / len(resolved_only)
+        avg_predicted_p = sum(c.get("p") or 0.5 for _, c in resolved_only) / len(resolved_only)
+
+        if actual_wr > avg_predicted_p + 0.05:
+            adj = min(0.02, _TUNE_MAX_STEP * _strategy["kelly_fraction"])
+            _strategy["kelly_fraction"] = min(_strategy["kelly_fraction"] + adj, _TUNE_BOUNDS["kelly_fraction"][1])
+        elif actual_wr < avg_predicted_p - 0.05:
+            adj = min(0.02, _TUNE_MAX_STEP * _strategy["kelly_fraction"])
+            _strategy["kelly_fraction"] = max(_strategy["kelly_fraction"] - adj, _TUNE_BOUNDS["kelly_fraction"][0])
+
+    # --- min_confidence (signal: which confidence band has best avg PnL) ---
+    conf_bands = [(0.40, []), (0.45, []), (0.50, []), (0.55, []), (0.60, []), (0.65, [])]
+    for _, c in recent_pairs:
+        pos_p = c.get("p")
+        if pos_p is None:
+            continue
+        for threshold, group in conf_bands:
+            if pos_p >= threshold:
+                group.append(c.get("pnl") or 0)
+
+    best_conf  = _strategy["min_confidence"]
+    best_ratio = None
+    for threshold, pnls in conf_bands:
+        if len(pnls) >= 5:
+            ratio = sum(pnls) / len(pnls)
+            if best_ratio is None or ratio > best_ratio:
+                best_ratio = ratio
+                best_conf  = threshold
+
+    current = _strategy["min_confidence"]
+    delta   = best_conf - current
+    capped  = max(-_TUNE_MAX_STEP * current, min(_TUNE_MAX_STEP * current, delta))
+    _strategy["min_confidence"] = round(
+        max(_TUNE_BOUNDS["min_confidence"][0], min(_TUNE_BOUNDS["min_confidence"][1], current + capped)), 4
+    )
+
+    # --- take_profit_roi (signal: profitable exit rate and stop frequency) ---
+    total_recent   = len(recent_pairs)
+    profitable_n   = sum(1 for _, c in recent_pairs if (c.get("pnl") or 0) > 0)
+    stop_n         = sum(1 for _, c in recent_pairs if c.get("close_reason") in ("stop_loss", "trailing_stop"))
+
+    if total_recent > 0:
+        profit_rate = profitable_n / total_recent
+        stop_rate   = stop_n / total_recent
+
+        if profit_rate > 0.60 and stop_rate < 0.20:
+            adj = min(0.01, _TUNE_MAX_STEP * _strategy["take_profit_roi"])
+            _strategy["take_profit_roi"] = min(_strategy["take_profit_roi"] + adj, _TUNE_BOUNDS["take_profit_roi"][1])
+        elif profit_rate < 0.45 or stop_rate > 0.40:
+            adj = min(0.01, _TUNE_MAX_STEP * _strategy["take_profit_roi"])
+            _strategy["take_profit_roi"] = max(_strategy["take_profit_roi"] - adj, _TUNE_BOUNDS["take_profit_roi"][0])
+
+    changes = []
+    for k in ("min_confidence", "take_profit_roi", "kelly_fraction"):
+        if abs(_strategy[k] - old[k]) > 0.001:
+            changes.append(f"{k}: {old[k]:.3f}->{_strategy[k]:.3f}")
+
+    if changes:
+        print(f"  [TUNE] {', '.join(changes)}")
+        try:
+            STRATEGY_FILE.write_text(json.dumps(_strategy, indent=2), encoding="utf-8")
+        except Exception as e:
+            print(f"  [TUNE] Failed to save: {e}")
+
+# =============================================================================
+# REPORT / STATUS
+# =============================================================================
+
+def print_status():
+    state    = load_state()
+    markets  = load_all_markets()
+    open_pos = [m for m in markets if get_active_cycle(m) is not None]
+
+    bal      = state["balance"]
+    start    = state["starting_balance"]
+    ret_pct  = (bal - start) / start * 100
+    prof     = state.get("profitable_exits", 0)
+    loss_e   = state.get("losing_exits", 0)
+    r_wins   = state.get("resolved_wins", 0)
+    r_loss   = state.get("resolved_losses", 0)
+    net_pnl  = state.get("net_pnl", 0.0)
+    total    = prof + loss_e
+    r_total  = r_wins + r_loss
+
+    real_bal = get_real_balance()
+    real_str = f"  On-chain USDC:  ${real_bal:,.2f}" if real_bal is not None else "  On-chain USDC:  (unavailable)"
+
+    print(f"\n{'='*58}")
+    print(f"  WEATHERBET — STATUS  (v4 Strategy)")
+    print(f"{'='*58}")
+    print(f"  Balance:        ${bal:,.2f}  (start ${start:,.2f}, {'+'if ret_pct>=0 else ''}{ret_pct:.1f}%)")
+    print(real_str)
+    if total:
+        wr_str  = f"{prof/total:.0%}"
+        pnl_str = f"{'+'if net_pnl>=0 else ''}{net_pnl:.2f}"
+        print(f"  Exits:          {total} | Profitable: {prof} | Losing: {loss_e} | WR: {wr_str} | Net PnL: {pnl_str}")
+    else:
+        print(f"  Exits:          none yet")
+    if r_total:
+        print(f"  Resolved:       {r_total} | W: {r_wins} | L: {r_loss} | WR: {r_wins/r_total:.0%}")
+    else:
+        print(f"  Resolved:       none yet")
+    print(f"  Open positions: {len(open_pos)}")
+    print(f"\n  Strategy (live): confidence>={_strategy['min_confidence']:.2f}  "
+          f"take_profit={_strategy['take_profit_roi']:.0%}  kelly={_strategy['kelly_fraction']:.2f}")
+
+    if open_pos:
+        print(f"\n  Open positions:")
+        total_unrealized = 0.0
+        for m in open_pos:
+            pos      = get_active_cycle(m)
+            unit_sym = "F" if m["unit"] == "F" else "C"
+            label    = f"{pos['bucket_low']}-{pos['bucket_high']}{unit_sym} [C{pos['cycle_num']}]"
+
+            current_price = pos["entry_price"]
+            for o in m.get("all_outcomes", []):
+                if o["market_id"] == pos["market_id"]:
+                    current_price = o["price"]
+                    break
+
+            unrealized = round((current_price - pos["entry_price"]) * pos["shares"], 2)
+            total_unrealized += unrealized
+            pnl_str = f"{'+'if unrealized>=0 else ''}{unrealized:.2f}"
+            print(f"    {m['city_name']:<16} {m['date']} | {label:<20} | "
+                  f"entry ${pos['entry_price']:.3f} -> ${current_price:.3f} | "
+                  f"P={pos.get('p', 0):.0%} | PnL: {pnl_str}")
+
+        sign = "+" if total_unrealized >= 0 else ""
+        print(f"\n  Unrealized PnL: {sign}{total_unrealized:.2f}")
+
+    print(f"{'='*58}\n")
+
+
+def print_report():
+    markets  = load_all_markets()
+    resolved = [m for m in markets if m["status"] == "resolved" and m.get("pnl") is not None]
+
+    print(f"\n{'='*58}")
+    print(f"  WEATHERBET — FULL REPORT  (v4 Strategy)")
+    print(f"{'='*58}")
+
+    if not resolved:
+        print("  No resolved markets yet.")
+        return
+
+    total_pnl = sum(m["pnl"] for m in resolved)
+    wins      = [m for m in resolved if m["resolved_outcome"] == "win"]
+    losses    = [m for m in resolved if m["resolved_outcome"] == "loss"]
+
+    print(f"\n  Total resolved: {len(resolved)}")
+    print(f"  Wins:           {len(wins)} | Losses: {len(losses)}")
+    print(f"  Win rate:       {len(wins)/len(resolved):.0%}")
+    print(f"  Total PnL:      {'+'if total_pnl>=0 else ''}{total_pnl:.2f}")
+
+    print(f"\n  By city:")
+    for city in sorted(set(m["city"] for m in resolved)):
+        group = [m for m in resolved if m["city"] == city]
+        w     = len([m for m in group if m["resolved_outcome"] == "win"])
+        pnl   = sum(m["pnl"] for m in group)
+        name  = LOCATIONS[city]["name"]
+        print(f"    {name:<16} {w}/{len(group)} ({w/len(group):.0%})  PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+
+    print(f"\n  Market details:")
+    for m in sorted(resolved, key=lambda x: x["date"]):
+        unit_sym = "F" if m["unit"] == "F" else "C"
+        snaps    = m.get("forecast_snapshots", [])
+        first_fc = snaps[0]["best"] if snaps else None
+        last_fc  = snaps[-1]["best"] if snaps else None
+        result   = m["resolved_outcome"].upper()
+        mkt_pnl  = f"{'+'if (m['pnl'] or 0)>=0 else ''}{m['pnl']:.2f}" if m["pnl"] is not None else "-"
+        fc_str   = f"forecast {first_fc}->{last_fc}{unit_sym}" if first_fc else "no forecast"
+        actual   = f"actual {m['actual_temp']}{unit_sym}" if m.get("actual_temp") else ""
+        cycles   = m.get("cycles", [])
+        if cycles:
+            for c in cycles:
+                label  = f"{c.get('bucket_low')}-{c.get('bucket_high')}{unit_sym} C{c['cycle_num']}"
+                c_pnl  = f"{'+'if (c.get('pnl') or 0)>=0 else ''}{(c.get('pnl') or 0):.2f}"
+                reason = c.get("close_reason", "?")
+                print(f"    {m['city_name']:<16} {m['date']} | {label:<18} | {fc_str} | {actual} | {result} {c_pnl} ({reason})")
+        else:
+            print(f"    {m['city_name']:<16} {m['date']} | no cycles       | {fc_str} | {actual} | {result} {mkt_pnl}")
+
+    print(f"{'='*58}\n")
+
+# =============================================================================
+# MAIN LOOP
+# =============================================================================
+
+def main():
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1].lower()
+        if cmd == "status":
+            print_status()
+            return
+        if cmd == "report":
+            print_report()
+            return
+        print(f"Unknown command: {cmd}")
+        print("Usage: python bot_v3.py [status|report]")
+        return
+
+    print(f"\n{'='*58}")
+    print(f"  WEATHERBET — Starting (v4 Strategy)")
+    print(f"  Regions: {sorted(SCAN_REGIONS)}")
+    print(f"  Strategy: min_ev={_strategy['min_ev']:.0%}  "
+          f"take_profit={_strategy['take_profit_roi']:.0%}  kelly={_strategy['kelly_fraction']:.2f}")
+    print(f"  Entry zone: ${MIN_ENTRY_PRICE:.2f} – ${MAX_ENTRY_PRICE:.2f}")
+    print(f"  Stop-loss: {(1-STOP_LOSS_PCT)*100:.0f}%  Trailing: activates at +20%")
+    print(f"  Scan: every {SCAN_INTERVAL//60}min  Monitor: every {MONITOR_INTERVAL//60}min")
+    print(f"{'='*58}\n")
+
     global _cal
     _cal = load_cal()
 
-    print(f"\n{'='*55}")
-    print(f"  WEATHERBET v3 — STARTING (REAL TRADES)")
-    print(f"{'='*55}")
-    print(f"  Cities:     {len(LOCATIONS)}")
-    print(f"  Max bet:    ${MAX_BET} | Min EV: {_strategy['min_ev']} | Max price: {_strategy['max_price']}")
-    print(f"  Kelly:      {_strategy['kelly_fraction']} | Tuning: {'ON' if TUNE_ENABLED else 'OFF'}")
-    print(f"  Scan:       {SCAN_INTERVAL//60} min | Monitor: {MONITOR_INTERVAL//60} min")
-    print(f"  Sources:    ECMWF + HRRR(US) ensemble | METAR(ref only)")
-    print(f"  Limits:     {MAX_OPEN_POS} max positions | {MAX_POS_PER_DATE}/date")
-    print(f"  Data:       {DATA_DIR.resolve()}")
-
-    if not VC_KEY_VALID:
-        print(f"  WARNING: vc_key not configured — calibration disabled (no actual temps)")
-
-    real_bal = get_real_balance()
-    if real_bal is None:
-        print(f"  WARNING: Could not fetch on-chain balance — check your keys in config.json")
-    else:
-        print(f"  Wallet USDC: ${real_bal:,.2f}")
-    print(f"  Ctrl+C to stop\n")
-
-    last_full_scan = 0
+    last_scan    = 0.0
+    last_monitor = 0.0
 
     while True:
-        now_ts  = time.time()
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_ts = time.time()
 
-        if now_ts - last_full_scan >= SCAN_INTERVAL:
-            print(f"[{now_str}] full scan...")
-            try:
-                new_pos, closed, resolved = scan_and_update()
-                state = load_state()
-                print(f"  balance: ${state['balance']:,.2f} | "
-                      f"new: {new_pos} | closed: {closed} | resolved: {resolved}")
-                last_full_scan = time.time()
-            except KeyboardInterrupt:
-                print(f"\n  Stopping — saving state...")
-                save_state(load_state())
-                print(f"  Done. Bye!")
-                break
-            except requests.exceptions.ConnectionError:
-                print(f"  Connection lost — waiting 60 sec")
-                time.sleep(60)
-                continue
-            except Exception as e:
-                print(f"  Error: {e} — waiting 60 sec")
-                time.sleep(60)
-                continue
-        else:
-            print(f"[{now_str}] monitoring positions...")
-            try:
-                stopped = monitor_positions()
-                if stopped:
-                    state = load_state()
-                    print(f"  balance: ${state['balance']:,.2f}")
-            except Exception as e:
-                print(f"  Monitor error: {e}")
+        if now_ts - last_monitor >= MONITOR_INTERVAL:
+            last_monitor = now_ts
+            print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Monitoring positions...")
+            n = monitor_positions()
+            if n:
+                print(f"  Closed {n} position(s)")
 
-        try:
-            time.sleep(MONITOR_INTERVAL)
-        except KeyboardInterrupt:
-            print(f"\n  Stopping — saving state...")
-            save_state(load_state())
-            print(f"  Done. Bye!")
-            break
+        if now_ts - last_scan >= SCAN_INTERVAL:
+            last_scan = now_ts
+            print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Full scan starting...")
+            new_pos, closed, resolved = scan_and_update()
+            print(f"  Scan complete — opened: {new_pos}, closed: {closed}, resolved: {resolved}")
 
-# =============================================================================
-# CLI
-# =============================================================================
+            # Print brief balance summary after each scan
+            state = load_state()
+            bal   = state["balance"]
+            start = state["starting_balance"]
+            roi   = (bal - start) / start * 100
+            print(f"  Balance: ${bal:.2f} ({'+'if roi>=0 else ''}{roi:.1f}% vs start)\n")
+
+        time.sleep(30)
+
 
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
-    if cmd == "run":
-        run_loop()
-    elif cmd == "status":
-        _cal = load_cal()
-        print_status()
-    elif cmd == "report":
-        _cal = load_cal()
-        print_report()
-    else:
-        print("Usage: python bot_v3.py [run|status|report]")
+    main()
