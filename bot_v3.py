@@ -330,9 +330,13 @@ def bucket_prob(forecast, t_low, t_high, sigma=None):
     if s <= 0:
         s = 0.01
     if t_low == -999:
-        return norm_cdf((t_high - float(forecast)) / s)
+        # Terminal lower bucket: "X°F or below" resolves YES for any reading that rounds to ≤X,
+        # i.e. continuous range (-∞, X+0.5). Apply the same ±0.5 expansion as bounded buckets.
+        return norm_cdf((t_high + 0.5 - float(forecast)) / s)
     if t_high == 999:
-        return 1.0 - norm_cdf((t_low - float(forecast)) / s)
+        # Terminal upper bucket: "X°F or higher" resolves YES for any reading that rounds to ≥X,
+        # i.e. continuous range (X-0.5, +∞). Apply the same ±0.5 expansion as bounded buckets.
+        return 1.0 - norm_cdf((t_low - 0.5 - float(forecast)) / s)
     # Bounded bucket — expand by ±0.5 for integer rounding on both EU and US markets
     return norm_cdf((t_high + 0.5 - float(forecast)) / s) - norm_cdf((t_low - 0.5 - float(forecast)) / s)
 
@@ -795,21 +799,24 @@ def find_best_entry(outcomes, forecast_temp, sigma, balance, market_record):
     """
     Find the best entry candidate using the v4 confidence-first strategy.
 
-    Scores all buckets by probability. Selects the highest-probability bucket
-    that satisfies all entry gates. Returns an entry dict or None.
+    Scores all buckets by probability descending. Checks the highest-probability
+    bucket against all strategy gates. Returns an entry dict or None.
 
-    Gates (all must pass):
+    Strategy gates (top-bucket failures skip the market entirely — no fallback):
       1. Price in opportunity zone: MIN_ENTRY_PRICE..MAX_ENTRY_PRICE
-      2. Edge: EV = p/price - 1 >= min_ev (we have edge over market implied probability)
-      3. Longshot floor: p >= 0.10 (never bet on < 10% regardless of price)
-      4. Price trend: flat or rising vs last scan
-      5. Volume >= MIN_VOLUME
+      2. Confidence: p >= min_confidence (more likely right than wrong)
+      3. Edge: EV = p/price - 1 >= min_ev (model has positive edge over market)
+
+    Data/liquidity gates (use continue — bucket is valid, data may improve):
+      4. Volume >= MIN_VOLUME
+      5. Price trend: flat or rising vs last scan
       6. Bet size >= MIN_BET after Kelly sizing
     """
     if not outcomes or forecast_temp is None:
         return None
 
-    min_ev = _strategy.get("min_ev", 0.10)
+    min_conf = _strategy["min_confidence"]
+    min_ev   = _strategy.get("min_ev", 0.05)
 
     # Score all buckets by probability descending
     scored = []
@@ -820,31 +827,42 @@ def find_best_entry(outcomes, forecast_temp, sigma, balance, market_record):
     scored.sort(key=lambda x: x[0], reverse=True)
 
     for p, o in scored:
-        # Hard longshot floor — sorted list, so all below this also fail
+        # Hard longshot floor — sorted desc, so all remaining also fail
         if p < 0.10:
             break
 
         yes_price = o["price"]
 
-        # Gate: opportunity zone
-        if yes_price < MIN_ENTRY_PRICE or yes_price > MAX_ENTRY_PRICE:
-            continue
+        # --- STRATEGY GATES: top-bucket failure = skip market entirely ---
 
-        # Gate: edge over market — our model must assign meaningfully more
-        # probability than the market price implies (EV = p/price - 1)
+        # Gate 1: opportunity zone
+        # Above 0.65: not enough room for a 35% ROI exit to $1.
+        # Below 0.25: longshot the market has correctly priced cheap.
+        if yes_price < MIN_ENTRY_PRICE or yes_price > MAX_ENTRY_PRICE:
+            return None
+
+        # Gate 2: confidence-first — must clear the min_confidence threshold.
+        # List is sorted descending, so all remaining buckets are also below threshold.
+        if p < min_conf:
+            return None
+
+        # Gate 3: positive edge over the market price.
+        # EV = p/price - 1: our model must assign more probability than the price implies.
         ev = calc_ev(p, yes_price)
         if ev < min_ev:
-            continue
+            return None
 
-        # Gate: minimum volume
+        # --- DATA / LIQUIDITY GATES: use continue, not return None ---
+
+        # Gate 4: minimum volume
         if o.get("volume", 0) < MIN_VOLUME:
             continue
 
-        # Gate: price trend (flat or rising)
+        # Gate 5: price trend (flat or rising — falling prices = market moving against us)
         if not is_price_stable_or_rising(market_record, o.get("token_id", ""), window=2):
             continue
 
-        # Gate: minimum bet size
+        # Gate 6: minimum bet size after Kelly sizing
         kelly = calc_kelly(p, yes_price)
         size  = bet_size(kelly, balance)
         if size < MIN_BET:
@@ -913,13 +931,12 @@ def evaluate_reentry(cycles, outcomes, forecast_temp, sigma, hours):
     if current_price > MAX_REENTRY_PRICE or current_price < MIN_ENTRY_PRICE:
         return None
 
-    # Gate: fresh edge check on the same bucket — require min EV
+    # Gate: fresh confidence check on the same bucket using current forecast.
+    # Must still clear min_confidence — same standard as initial entry.
     if forecast_temp is None:
         return None
     p = bucket_prob(forecast_temp, t_low, t_high, sigma)
-    if p < 0.10:
-        return None
-    if calc_ev(p, current_price) < _strategy.get("min_ev", 0.10):
+    if p < _strategy["min_confidence"]:
         return None
 
     return {
@@ -950,6 +967,11 @@ def scan_and_update():
     new_pos  = 0
     closed   = 0
     resolved = 0
+
+    # Load all markets once before the scan loop for portfolio cap checks.
+    # We refresh this snapshot after the loop rather than on every city/date
+    # iteration (previously caused up to 40 redundant full-directory reads per scan).
+    all_mkts_cache = load_all_markets()
 
     for city_slug, loc in LOCATIONS.items():
         if loc.get("region") not in SCAN_REGIONS:
@@ -1090,6 +1112,9 @@ def scan_and_update():
                             real_entry = get_real_entry_price(tid)
                             entry      = real_entry if real_entry is not None else cp
                             cycle_num  = len(cycles) + 1
+                            # Compute current bucket probability so forecast_changed exit works
+                            recon_p = round(bucket_prob(forecast_temp, t_low, t_high, sigma), 4) \
+                                      if forecast_temp is not None else None
                             print(f"  [RECONCILE] {loc['name']} {date} [C{cycle_num}] — "
                                   f"{onchain:.1f} orphaned shares ({t_low}-{t_high}{unit_sym}) "
                                   f"entry ${entry:.4f}, market ${cp:.3f}")
@@ -1103,7 +1128,7 @@ def scan_and_update():
                                 "entry_price":        entry,
                                 "shares":             round(onchain, 2),
                                 "cost":               round(onchain * entry, 2),
-                                "p":                  None,
+                                "p":                  recon_p,
                                 "ev":                 None,
                                 "kelly":              None,
                                 "forecast_temp":      forecast_temp,
@@ -1193,58 +1218,62 @@ def scan_and_update():
                                 print(f"  [SELL FAIL] {loc['name']} {date} — will retry next cycle")
 
             # ---- FORECAST SHIFT EXIT ----
-            # Exit when the updated forecast drops the held bucket's probability
-            # below the entry confidence threshold (with a 5% hysteresis buffer).
-            # Uses bucket_prob() so bounded, upper-unbounded, and lower-unbounded
-            # buckets are all handled correctly.
+            # Exit when the updated forecast drops the bucket's probability below
+            # min_confidence AND the position is already losing.
+            #
+            # Gating on "position is losing" is critical: we don't cut a winner
+            # because the forecast softened slightly — the take-profit will handle
+            # that. We only use this exit to escape a losing position whose model
+            # conviction has genuinely evaporated.
             pos = get_active_cycle(mkt)
             if pos is not None and forecast_temp is not None:
                 t_low   = pos["bucket_low"]
                 t_high  = pos["bucket_high"]
-                entry_p = pos.get("p") or 0.0
                 new_p   = bucket_prob(forecast_temp, t_low, t_high, sigma)
-                # Exit if probability dropped >30% from entry level, or below hard floor.
-                # Using a relative drop avoids the absolute-threshold issue for narrow buckets
-                # (e.g., 1°C EU buckets max out at ~32%, so a fixed 0.45 threshold would
-                # always fire).
-                shifted = new_p < 0.10 or (entry_p > 0 and new_p < entry_p * 0.70)
+                current_price = next(
+                    (o["price"] for o in outcomes if o["market_id"] == pos["market_id"]),
+                    None
+                )
+                # Trigger only when: model no longer supports min_confidence
+                #                AND the market is already moving against us
+                shifted = (
+                    new_p < _strategy["min_confidence"]
+                    and current_price is not None
+                    and current_price < pos["entry_price"]
+                )
                 if shifted:
-                    current_price = next(
-                        (o["price"] for o in outcomes if o["market_id"] == pos["market_id"]),
-                        None
-                    )
-                    if current_price is not None:
-                        resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
-                        if resp is not None:
-                            entry    = pos["entry_price"]
-                            entry_p  = pos.get("p") or 0.0
-                            pnl      = round((current_price - entry) * pos["shares"], 2)
-                            pos["exit_price"]   = current_price
-                            pos["pnl"]          = pnl
-                            pos["status"]       = "closed"
-                            pos["close_reason"] = "forecast_changed"
-                            pos["closed_at"]    = ts_now
-                            closed += 1
-                            state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
-                            if pnl > 0:
-                                state["profitable_exits"] = state.get("profitable_exits", 0) + 1
-                            else:
-                                state["losing_exits"] = state.get("losing_exits", 0) + 1
-                            print(f"  [FORECAST] {loc['name']} {date} [C{pos['cycle_num']}] — "
-                                  f"p={entry_p:.0%}→{new_p:.0%} (fc {pos.get('forecast_temp')}→{forecast_temp}{unit}) | "
-                                  f"PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                    resp = place_sell_order(pos["token_id"], pos["shares"], current_price, market_id=pos["market_id"])
+                    if resp is not None:
+                        entry   = pos["entry_price"]
+                        entry_p = pos.get("p") or 0.0
+                        pnl     = round((current_price - entry) * pos["shares"], 2)
+                        pos["exit_price"]   = current_price
+                        pos["pnl"]          = pnl
+                        pos["status"]       = "closed"
+                        pos["close_reason"] = "forecast_changed"
+                        pos["closed_at"]    = ts_now
+                        closed += 1
+                        state["net_pnl"] = round(state.get("net_pnl", 0.0) + pnl, 2)
+                        if pnl > 0:
+                            state["profitable_exits"] = state.get("profitable_exits", 0) + 1
                         else:
-                            print(f"  [SELL FAIL] {loc['name']} {date} — will retry next cycle")
+                            state["losing_exits"] = state.get("losing_exits", 0) + 1
+                        print(f"  [FORECAST] {loc['name']} {date} [C{pos['cycle_num']}] — "
+                              f"p={entry_p:.0%}→{new_p:.0%} (fc {pos.get('forecast_temp')}→{forecast_temp}{unit}) | "
+                              f"PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                    else:
+                        print(f"  [SELL FAIL] {loc['name']} {date} — will retry next cycle")
 
             # ---- OPEN POSITION ----
             pos        = get_active_cycle(mkt)
             cycles_all = mkt.get("cycles", [])
 
             if pos is None and len(cycles_all) < MAX_CYCLES and hours >= MIN_HOURS:
-                # Portfolio-level caps
-                all_mkts   = load_all_markets()
-                total_open = sum(1 for m in all_mkts if get_active_cycle(m) is not None)
-                date_open  = sum(1 for m in all_mkts if get_active_cycle(m) is not None and m["date"] == date)
+                # Portfolio-level caps — use the pre-loaded snapshot (accurate enough;
+                # any positions opened earlier in this same scan are already reflected
+                # because we append to all_mkts_cache below when new_pos increments).
+                total_open = sum(1 for m in all_mkts_cache if get_active_cycle(m) is not None)
+                date_open  = sum(1 for m in all_mkts_cache if get_active_cycle(m) is not None and m["date"] == date)
                 if total_open >= MAX_OPEN_POS or date_open >= MAX_POS_PER_DATE:
                     save_market(mkt)
                     time.sleep(0.1)
@@ -1347,6 +1376,9 @@ def scan_and_update():
                                     balance -= candidate["cost"]
                                     state["total_trades"] += 1
                                     new_pos += 1
+                                    # Keep cap-check cache current for remaining markets in this scan
+                                    if mkt not in all_mkts_cache:
+                                        all_mkts_cache.append(mkt)
                                     print(f"  [{entry_type}] {loc['name']} {horizon} {date} [C{cycle_num}] | "
                                           f"{bucket_label} | ${candidate['entry_price']:.3f} | "
                                           f"P={candidate['p']:.0%} EV={candidate['ev']:+.2f} | "
@@ -1493,6 +1525,14 @@ def monitor_positions():
             real_entry = get_real_entry_price(last_cycle["token_id"])
             entry      = real_entry if real_entry is not None else current_price
             cycle_num  = len(cycles) + 1
+            # Best-effort p using last cycle's forecast — monitor has no fresh forecast.
+            # The next full scan will update this via the forecast_changed logic.
+            last_fc    = last_cycle.get("forecast_temp")
+            last_sigma = last_cycle.get("sigma")
+            t_low_r    = last_cycle["bucket_low"]
+            t_high_r   = last_cycle["bucket_high"]
+            recon_p    = round(bucket_prob(last_fc, t_low_r, t_high_r, last_sigma), 4) \
+                         if last_fc is not None and last_sigma is not None else None
             print(f"  [RECONCILE] {city_name} {mkt['date']} [C{cycle_num}] — "
                   f"{onchain:.1f} orphaned shares (entry ${entry:.4f}, market ${current_price:.3f})")
             mkt["cycles"].append({
@@ -1505,12 +1545,12 @@ def monitor_positions():
                 "entry_price":        entry,
                 "shares":             round(onchain, 2),
                 "cost":               round(onchain * entry, 2),
-                "p":                  None,
+                "p":                  recon_p,
                 "ev":                 None,
                 "kelly":              None,
-                "forecast_temp":      None,
-                "forecast_src":       None,
-                "sigma":              None,
+                "forecast_temp":      last_fc,
+                "forecast_src":       last_cycle.get("forecast_src"),
+                "sigma":              last_sigma,
                 "opened_at":          datetime.now(timezone.utc).isoformat(),
                 "status":             "open",
                 "pnl":                None,
@@ -1683,24 +1723,30 @@ def tune_strategy(markets):
             adj = min(0.02, _TUNE_MAX_STEP * _strategy["kelly_fraction"])
             _strategy["kelly_fraction"] = max(_strategy["kelly_fraction"] - adj, _TUNE_BOUNDS["kelly_fraction"][0])
 
-    # --- min_confidence (signal: which confidence band has best avg PnL) ---
-    conf_bands = [(0.40, []), (0.45, []), (0.50, []), (0.55, []), (0.60, []), (0.65, [])]
+    # --- min_confidence (signal: which exclusive confidence band has best avg PnL) ---
+    # Bands are exclusive ranges so each cycle lands in exactly one bucket.
+    # This prevents the lower bands (which used to accumulate all trades) from
+    # dominating and pushing the threshold toward the minimum.
+    conf_band_ranges = [(0.35, 0.40), (0.40, 0.45), (0.45, 0.50), (0.50, 0.55), (0.55, 0.60), (0.60, 1.01)]
+    band_pnls = {lo: [] for lo, _ in conf_band_ranges}
+
     for _, c in recent_pairs:
         pos_p = c.get("p")
         if pos_p is None:
             continue
-        for threshold, group in conf_bands:
-            if pos_p >= threshold:
-                group.append(c.get("pnl") or 0)
+        for lo, hi in conf_band_ranges:
+            if lo <= pos_p < hi:
+                band_pnls[lo].append(c.get("pnl") or 0)
+                break
 
     best_conf  = _strategy["min_confidence"]
     best_ratio = None
-    for threshold, pnls in conf_bands:
-        if len(pnls) >= 5:
+    for lo, pnls in band_pnls.items():
+        if len(pnls) >= 3:   # lower threshold: exclusive bands have fewer entries each
             ratio = sum(pnls) / len(pnls)
             if best_ratio is None or ratio > best_ratio:
                 best_ratio = ratio
-                best_conf  = threshold
+                best_conf  = lo   # use floor of the best-performing band
 
     current = _strategy["min_confidence"]
     delta   = best_conf - current
