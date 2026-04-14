@@ -34,6 +34,7 @@ from py_clob_client.clob_types import (
     BalanceAllowanceParams, AssetType,
 )
 from py_clob_client.order_builder.constants import BUY, SELL
+from llm_advisor import build_context, assess_cycle, NEUTRAL_ASSESSMENT
 
 # =============================================================================
 # PER-COIN DEFAULTS
@@ -178,6 +179,11 @@ MARKETS_DIR.mkdir(exist_ok=True)
 
 GAMMA_API   = "https://gamma-api.polymarket.com"
 BINANCE_API = "https://api.binance.com/api/v3"
+
+# LLM advisor (OpenRouter)
+OPENROUTER_API_KEY = _cfg.get("openrouter_api_key", "")
+LLM_MODEL          = _cfg.get("llm_model", "google/gemini-2.5-flash-preview-05-20")
+LLM_ENABLED        = _cfg.get("llm_enabled", False)
 
 # ---------------------------------------------------------------------------
 # Mutable strategy — persisted to strategy.json, updated by tune_strategy()
@@ -500,16 +506,25 @@ def find_active_markets() -> list[dict]:
             continue
 
         result.append({
-            "slug":           slug,
-            "event_start":    start_dt.isoformat(),
-            "event_end":      end_dt.isoformat(),
-            "seconds_to_end": seconds_to_end,
-            "up_token_id":    str(token_ids[0]),
-            "down_token_id":  str(token_ids[1]),
-            "up_price":       up_price,
-            "down_price":     down_price,
-            "liquidity":      float(mkt.get("liquidityNum") or ev.get("liquidity") or 0),
-            "market_id":      str(mkt.get("id", "")),
+            "slug":               slug,
+            "event_start":        start_dt.isoformat(),
+            "event_end":          end_dt.isoformat(),
+            "seconds_to_end":     seconds_to_end,
+            "up_token_id":        str(token_ids[0]),
+            "down_token_id":      str(token_ids[1]),
+            "up_price":           up_price,
+            "down_price":         down_price,
+            "liquidity":          float(mkt.get("liquidityNum") or ev.get("liquidity") or 0),
+            "market_id":          str(mkt.get("id", "")),
+            # --- Polymarket crowd signals (LLM context enrichment) ---
+            "volume_24hr":        float(mkt.get("volume24hr") or 0.0),
+            "open_interest":      float(ev.get("openInterest") or 0.0),
+            "spread":             float(mkt.get("spread") or 0.0),
+            "competitive":        float(mkt.get("competitive") or 0.0),
+            "one_hour_price_chg": float(mkt.get("oneHourPriceChange") or 0.0),
+            "last_trade_price":   float(mkt.get("lastTradePrice") or up_price),
+            "best_bid":           float(mkt.get("bestBid") or 0.0),
+            "best_ask":           float(mkt.get("bestAsk") or 0.0),
         })
 
     return result
@@ -566,6 +581,57 @@ def fetch_price_state() -> dict:
     except Exception as e:
         print(f"  [BINANCE] Depth fetch failed: {e}")
     return state
+
+
+# ---------------------------------------------------------------------------
+# CLOB price history — crowd sentiment trajectory for LLM context
+# ---------------------------------------------------------------------------
+
+_price_history_cache: dict = {}   # token_id -> {"ts": float, "data": list}
+_PRICE_HIST_TTL = 60              # seconds — refresh once per scan cycle
+
+
+def _sample_price_history(points: list[dict], target: int, lookback_seconds: int) -> list[dict]:
+    """Downsample a dense CLOB price history to ~target evenly-spaced points."""
+    if not points:
+        return []
+    now  = time.time()
+    step = lookback_seconds / target
+    result = []
+    for i in range(target):
+        target_ts = now - lookback_seconds + i * step
+        closest   = min(points, key=lambda x: abs(x["t"] - target_ts))
+        minutes_ago = round((now - closest["t"]) / 60.0, 1)
+        result.append({"minutes_ago": minutes_ago, "p": closest["p"]})
+    return result
+
+
+def fetch_market_price_history(token_id: str, lookback_minutes: int = 30) -> list[dict]:
+    """
+    Fetch the Polymarket CLOB price trajectory for an Up token over the last
+    `lookback_minutes` minutes, downsampled to ~8 points.
+    Returns [] silently on any error.
+    """
+    if not token_id:
+        return []
+    now    = time.time()
+    cached = _price_history_cache.get(token_id)
+    if cached and now - cached["ts"] < _PRICE_HIST_TTL:
+        return cached["data"]
+    try:
+        start_ts = int(now - lookback_minutes * 60)
+        r = requests.get(
+            f"{POLYMARKET_HOST}/prices-history",
+            params={"market": token_id, "startTs": start_ts, "endTs": int(now), "fidelity": 1},
+            timeout=5,
+        )
+        r.raise_for_status()
+        points  = r.json().get("history", [])
+        sampled = _sample_price_history(points, target=8, lookback_seconds=lookback_minutes * 60)
+        _price_history_cache[token_id] = {"ts": now, "data": sampled}
+        return sampled
+    except Exception:
+        return []
 
 
 def _compute_rsi(closes: list[float], period: int = 14) -> float:
@@ -659,37 +725,58 @@ _FUD_KEYWORDS  = {
 }
 _PUMP_KEYWORDS = {"etf approved", "etf approval", "all-time high"}
 
+_raw_news_articles: list = []   # cached formatted articles for LLM context
 
-def check_news_clear() -> bool:
+
+def fetch_news_articles() -> tuple[bool, list]:
+    """
+    Fetch recent news. Returns (is_clear, articles).
+    is_clear: False if any FUD keyword detected in the last 30 min (existing gate).
+    articles: last 5 formatted articles from the last 60 min (for LLM context).
+    Cached for _NEWS_TTL seconds.
+    """
+    global _raw_news_articles
     now = time.time()
     if now - _news_cache["ts"] < _NEWS_TTL:
-        return _news_cache["clear"]
+        return _news_cache["clear"], _raw_news_articles
     try:
         r = requests.get(
             "https://min-api.cryptocompare.com/data/v2/news/",
             params={"lang": "EN", "categories": NEWS_CATEGORY, "sortOrder": "latest"},
             timeout=8,
         )
-        articles = r.json().get("Data", [])
-        cutoff = now - 1800
+        articles  = r.json().get("Data", [])
+        fud_cutoff = now - 1800   # 30 min for FUD gate (unchanged)
+        llm_cutoff = now - 3600   # 60 min window for LLM context
+        is_clear   = True
+        formatted  = []
         for article in articles:
-            if (article.get("published_on") or 0) < cutoff:
+            pub = article.get("published_on") or 0
+            if pub < llm_cutoff:
                 break
-            text = ((article.get("title") or "") + " " + (article.get("body") or "")[:200]).lower()
-            for kw in _PUMP_KEYWORDS:
-                if kw in text:
-                    print(f"  [NEWS] Bullish event ({kw!r}): {article.get('title', '')[:70]} — continuing")
-            for kw in _FUD_KEYWORDS:
-                if kw in text:
-                    print(f"  [NEWS] FUD detected ({kw!r}): {article.get('title', '')[:70]}")
-                    _news_cache.update({"ts": now, "clear": False})
-                    return False
-        _news_cache.update({"ts": now, "clear": True})
-        return True
+            title = article.get("title") or ""
+            body  = article.get("body")  or ""
+            text  = (title + " " + body[:200]).lower()
+            if pub >= fud_cutoff:
+                for kw in _PUMP_KEYWORDS:
+                    if kw in text:
+                        print(f"  [NEWS] Bullish event ({kw!r}): {title[:70]} — continuing")
+                for kw in _FUD_KEYWORDS:
+                    if kw in text:
+                        print(f"  [NEWS] FUD detected ({kw!r}): {title[:70]}")
+                        is_clear = False
+            formatted.append({
+                "title":        title[:120],
+                "body_excerpt": body[:300],
+                "age_minutes":  int((now - pub) / 60),
+            })
+        _raw_news_articles = formatted[:5]
+        _news_cache.update({"ts": now, "clear": is_clear})
+        return is_clear, _raw_news_articles
     except Exception as e:
         print(f"  [NEWS] Fetch failed ({e}) — assuming clear")
         _news_cache.update({"ts": now, "clear": True})
-        return True
+        return True, []
 
 
 def get_fear_greed() -> tuple[int, str]:
@@ -1015,7 +1102,7 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
         f"p_tech={p_technical:.3f}"
     )
 
-    news_clear = check_news_clear()
+    news_clear, _raw_news_articles = fetch_news_articles()
     if not news_clear:
         print(f"  [NEWS] Breaking {COIN} news detected — no bets this cycle.")
 
@@ -1023,6 +1110,53 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
     fg_adj = 0.02 if fg_val < 10 else (-0.02 if fg_val > 90 else 0.0)
     if fg_adj:
         print(f"  F&G={fg_val} ({fg_class}) → prior adj={fg_adj:+.2f}")
+
+    # --- Fetch Polymarket crowd price histories (for LLM context) ---
+    price_histories: dict = {}
+    if LLM_ENABLED and OPENROUTER_API_KEY:
+        for _m in markets:
+            price_histories[_m["slug"]] = fetch_market_price_history(_m["up_token_id"])
+
+    # --- LLM cycle assessment ---
+    llm_assessment = NEUTRAL_ASSESSMENT
+    if LLM_ENABLED and OPENROUTER_API_KEY:
+        try:
+            _all_mkts    = load_all_markets()
+            _open_pos    = [_m for _m in _all_mkts
+                            if (_m.get("position") or {}).get("status") == "open"]
+            _resolved    = [_m for _m in _all_mkts
+                            if _m.get("position")
+                            and _m["position"].get("status") in ("resolved", "closed")
+                            and _m["position"].get("pnl") is not None]
+            # Pass candles through signals dict so llm_advisor can derive candle stats
+            signals["_candles"] = price_state.get("candles", [])
+            _ctx = build_context(
+                coin=COIN,
+                current_price=current_price,
+                signals=signals,
+                p_technical=p_technical,
+                fg_val=fg_val,
+                fg_class=fg_class,
+                news_articles=_raw_news_articles,
+                active_markets=markets,
+                price_histories=price_histories,
+                resolved_history=_resolved[-25:],
+                open_positions=_open_pos,
+                state=state,
+                strategy=_strategy,
+            )
+            llm_assessment = assess_cycle(OPENROUTER_API_KEY, LLM_MODEL, _ctx)
+            print(
+                f"  [LLM] regime={llm_assessment['regime']} ({llm_assessment['regime_confidence']}) "
+                f"| news={llm_assessment['news_sentiment']} "
+                f"| veto={llm_assessment['cycle_veto']}"
+            )
+        except Exception as _e:
+            print(f"  [LLM] Context error ({_e}) — quantitative model only")
+
+    if llm_assessment["cycle_veto"]:
+        print(f"  [LLM VETO] {llm_assessment['cycle_veto_reason']} — skipping cycle")
+        return state
 
     open_slugs = list_open_slugs()
     new_this_cycle = 0
@@ -1199,10 +1333,24 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
             print(f"  [SKIP] {slug} — market one-sided (Up={mkt['up_price']:.3f}), crowd consensus too strong")
             continue
 
+        # --- LLM per-market overlay ---
+        llm_mkt      = llm_assessment["markets"].get(slug, {})
+        llm_action   = llm_mkt.get("action")           # "bet_up"|"bet_down"|"skip"|None
+        llm_p_adj    = float(llm_mkt.get("p_up_adj", 0.0))
+        llm_kelly_mx = float(llm_mkt.get("kelly_multiplier", 1.0))
+
+        if llm_action == "skip":
+            reason = llm_mkt.get("skip_reason") or "LLM recommends skip"
+            print(f"  [LLM SKIP] {slug} — {reason}")
+            continue
+
         # --- Probability estimation ---
         p_drift   = p_up_given_drift(drift, seconds_to_end)
         p_blended = blend_probabilities(p_drift, p_technical, abs(drift))
-        p_blended = max(0.10, min(0.90, p_blended + fg_adj))
+        p_blended = max(0.10, min(0.90, p_blended + fg_adj + llm_p_adj))
+        if llm_p_adj != 0.0:
+            print(f"  [LLM] {slug} p_up_adj={llm_p_adj:+.3f} → p_blended={p_blended:.3f}  "
+                  f"({llm_mkt.get('reasoning', '')[:80]})")
 
         up_price   = mkt["up_price"]
         down_price = mkt["down_price"]
@@ -1249,6 +1397,7 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
             continue
 
         kelly      = calc_kelly(p_win, entry_price)
+        kelly      = round(min(max(0.0, kelly) * llm_kelly_mx, 1.0), 4)
         if kelly <= 0:
             continue
         cost       = bet_size(kelly, balance)
@@ -1297,6 +1446,11 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
             "status":                "open",
             "outcome":               None,
             "pnl":                   None,
+            "llm_regime":            llm_assessment.get("regime"),
+            "llm_action":            llm_action,
+            "llm_p_adj":             round(llm_p_adj, 4),
+            "llm_kelly_mx":          round(llm_kelly_mx, 4),
+            "llm_reasoning":         llm_mkt.get("reasoning"),
         }
 
         if paper_mode:
@@ -1500,7 +1654,7 @@ def cmd_signals() -> None:
     sigs        = compute_technical_signals(price_state)
     p_up        = estimate_p_up_technical(sigs)
     fg_val, fg_class = get_fear_greed()
-    clear       = check_news_clear()
+    clear, _    = fetch_news_articles()
     print(f"\n{COIN}: ${price_state['current_price']:,.4f}")
     print(f"  momentum_1m  = {sigs['momentum_1m']*100:+.4f}%")
     print(f"  momentum_5m  = {sigs['momentum_5m']*100:+.4f}%")
