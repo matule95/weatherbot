@@ -156,12 +156,16 @@ ENTRY_MAX_SEC  = _cfg.get("btc_entry_window_max_sec", 660)
 SCAN_INTERVAL  = 60
 TUNE_LOOKBACK  = _cv("tune_lookback",  _cfg.get("btc_tune_lookback", 30))
 PRIOR_WEIGHT   = _cv("prior_weight",   _cfg.get("btc_prior_weight", 10))
-MONITOR_INTERVAL = _cfg.get("monitor_interval", 15)
-STOP_LOSS_PCT    = _cfg.get("stop_loss_pct", 0.80)
+MONITOR_INTERVAL    = _cfg.get("monitor_interval", 15)
+MAX_OPEN_POSITIONS  = _cv("max_open_positions", _cfg.get("max_open_positions", 2))
+STOP_LOSS_PCT       = _cfg.get("stop_loss_pct", 0.80)
 TAKE_PROFIT_SHORT= _cfg.get("take_profit_short", 0.85)
 TAKE_PROFIT_LONG = _cfg.get("take_profit_long", 0.75)
 TAKE_PROFIT_FINAL= _cfg.get("take_profit_final", 0.50)
 TAKE_PROFIT_ROI  = _cfg.get("take_profit_roi", 0.40)
+# Minimum allowed market price for either side before we consider the crowd's
+# consensus too strong to bet against. E.g. 0.10 means skip if Up > 0.90.
+MARKET_MIN_PRICE = _cfg.get("market_min_price", 0.10)
 
 # Data dirs — one per coin
 DATA_DIR         = Path(f"data_{COIN.lower()}")
@@ -515,6 +519,25 @@ def find_active_markets() -> list[dict]:
 # PRICE DATA  (Binance public API — no auth)
 # =============================================================================
 
+def fetch_historical_open(epoch_sec: int) -> float | None:
+    """Return the Binance 1-min open price at epoch_sec (closest market-start reference)."""
+    try:
+        r = requests.get(
+            f"{BINANCE_API}/klines",
+            params={"symbol": BINANCE_SYMBOL, "interval": "1m",
+                    "startTime": epoch_sec * 1000,
+                    "endTime":   (epoch_sec + 120) * 1000,
+                    "limit": 1},
+            timeout=5,
+        )
+        candles = r.json()
+        if candles:
+            return float(candles[0][1])   # index 1 = open price
+    except Exception as e:
+        print(f"  [BINANCE] Historical open fetch failed: {e}")
+    return None
+
+
 def fetch_price_state() -> dict:
     state = {"current_price": None, "candles": [], "bids": [], "asks": []}
     try:
@@ -653,9 +676,12 @@ def check_news_clear() -> bool:
             if (article.get("published_on") or 0) < cutoff:
                 break
             text = ((article.get("title") or "") + " " + (article.get("body") or "")[:200]).lower()
-            for kw in _FUD_KEYWORDS | _PUMP_KEYWORDS:
+            for kw in _PUMP_KEYWORDS:
                 if kw in text:
-                    print(f"  [NEWS] Event detected ({kw!r}): {article.get('title', '')[:70]}")
+                    print(f"  [NEWS] Bullish event ({kw!r}): {article.get('title', '')[:70]} — continuing")
+            for kw in _FUD_KEYWORDS:
+                if kw in text:
+                    print(f"  [NEWS] FUD detected ({kw!r}): {article.get('title', '')[:70]}")
                     _news_cache.update({"ts": now, "clear": False})
                     return False
         _news_cache.update({"ts": now, "clear": True})
@@ -807,7 +833,8 @@ def run_calibration(markets: list[dict]) -> None:
         return
 
     mean_abs  = sum(realized_returns) / len(realized_returns)
-    realized_annual = mean_abs * math.sqrt(365 * 96)
+    # E[|X|] = sigma * sqrt(2/pi) for N(0,sigma), so sigma = mean_abs * sqrt(pi/2)
+    realized_annual = mean_abs * math.sqrt(math.pi / 2.0) * math.sqrt(365 * 96)
 
     prior_vol = _strategy["annual_vol"]
     n         = len(realized_returns)
@@ -834,16 +861,26 @@ def run_calibration(markets: list[dict]) -> None:
         print(f"  [CAL] {COIN} annual_vol: {prior_vol:.3f} → {new_vol:.3f}  (n={n}, mean_15m={mean_abs*100:.3f}%)")
 
 
+def _position_won(pos: dict) -> bool:
+    """Return True if the position was a win.
+    For resolved markets, compare outcome to bet_side.
+    For early-closed positions (outcome=None), treat pnl > 0 as a win."""
+    if pos.get("outcome") is not None:
+        return pos["outcome"] == pos["bet_side"]
+    return (pos.get("pnl") or 0) > 0
+
+
 def tune_strategy(markets: list[dict]) -> None:
     """
-    Adjust strategy parameters from resolved bets:
+    Adjust strategy parameters from closed/resolved bets:
       1. kelly_fraction — based on actual vs predicted win rate
       2. min_ev         — find EV threshold band with best mean PnL/bet
       3. min_drift      — find drift threshold that predicts wins most reliably
     """
     resolved_bets = [
         m for m in markets
-        if m.get("position") and m["position"].get("status") == "resolved"
+        if m.get("position")
+           and m["position"].get("status") in ("resolved", "closed")
            and m["position"].get("pnl") is not None
     ]
     if len(resolved_bets) < TUNE_LOOKBACK:
@@ -853,7 +890,7 @@ def tune_strategy(markets: list[dict]) -> None:
     old    = dict(_strategy)
 
     # 1. Kelly vs win rate
-    wins      = sum(1 for m in recent if m["position"]["outcome"] == m["position"]["bet_side"])
+    wins      = sum(1 for m in recent if _position_won(m["position"]))
     actual_wr = wins / len(recent)
     avg_p     = sum(m["position"].get("p_final", 0.5) for m in recent) / len(recent)
     kf        = _strategy["kelly_fraction"]
@@ -864,12 +901,45 @@ def tune_strategy(markets: list[dict]) -> None:
     _strategy["kelly_fraction"] = round(kf, 4)
 
     # 2. min_ev — best-performing EV band
+    # Build synthetic near-miss records from skipped_ev + resolved outcome so the
+    # tuner can evaluate thresholds below the current min_ev (survivorship fix).
+    skipped_resolved = []
+    for m in markets:
+        sk = m.get("skipped_ev")
+        if not sk or m.get("position"):
+            continue
+        try:
+            end_dt = datetime.fromisoformat(m["event_end"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if (datetime.now(timezone.utc) - end_dt).total_seconds() < 60:
+            continue
+        snapshots = m.get("snapshots", [])
+        if not snapshots:
+            continue
+        end_price_snap = snapshots[-1].get("up_price")
+        if end_price_snap is None:
+            continue
+        # Infer outcome from resolved market price
+        if end_price_snap >= 0.95:
+            outcome = "Up"
+        elif end_price_snap <= 0.05:
+            outcome = "Down"
+        else:
+            continue
+        won  = (sk["side"] == outcome)
+        pnl  = round((1.0 - sk["price"]) * (sk["ev"] * 1.0), 4) if won else round(-sk["ev"], 4)
+        skipped_resolved.append({"ev": sk["ev"], "pnl": pnl})
+
     ev_thresholds = [0.03, 0.05, 0.07, 0.10, 0.15, 0.20]
     best_ev, best_ev_score = _strategy["min_ev"], -999.0
     for thresh in ev_thresholds:
         group = [m for m in recent if m["position"].get("ev", 0) >= thresh]
-        if len(group) >= 5:
-            mean_pnl = sum(m["position"]["pnl"] for m in group) / len(group)
+        # Augment with near-miss records that fall in this threshold band
+        shadow = [s for s in skipped_resolved if s["ev"] >= thresh]
+        combined = [m["position"]["pnl"] for m in group] + [s["pnl"] for s in shadow]
+        if len(combined) >= 5:
+            mean_pnl = sum(combined) / len(combined)
             if mean_pnl > best_ev_score:
                 best_ev_score = mean_pnl
                 best_ev       = thresh
@@ -955,6 +1025,7 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
         print(f"  F&G={fg_val} ({fg_class}) → prior adj={fg_adj:+.2f}")
 
     open_slugs = list_open_slugs()
+    new_this_cycle = 0
 
     for mkt in markets:
         slug           = mkt["slug"]
@@ -981,8 +1052,14 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
             start_dt = now
 
         if mdata["coin_start_price"] is None and now >= start_dt:
-            mdata["coin_start_price"] = current_price
-            print(f"  [START] {slug} — {COIN} start: ${current_price:,.4f}")
+            try:
+                start_epoch = int(slug.split("-")[-1])
+                hist = fetch_historical_open(start_epoch)
+            except Exception:
+                hist = None
+            mdata["coin_start_price"] = hist if hist else current_price
+            src = "historical" if hist else "current"
+            print(f"  [START] {slug} — {COIN} start: ${mdata['coin_start_price']:,.4f} ({src})")
 
         drift = 0.0
         if mdata["coin_start_price"]:
@@ -1052,15 +1129,21 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
                 minutes_left = seconds_to_end / 60.0
                 if minutes_left < 5:
                     take_profit = TAKE_PROFIT_FINAL
-                else:
+                elif minutes_left < 8:
                     take_profit = TAKE_PROFIT_SHORT
+                else:
+                    take_profit = TAKE_PROFIT_LONG
 
                 roi_threshold = entry * (1.0 + TAKE_PROFIT_ROI)
-                take_triggered = cp >= take_profit or cp >= roi_threshold
+                take_triggered = cp >= max(take_profit, entry) or cp >= roi_threshold
                 stop_triggered = cp <= stop
 
                 if take_triggered or stop_triggered:
                     mid = pos.get("market_id", mkt["market_id"])
+                    # Use actual on-chain balance to correct for partial fills at entry
+                    actual_shares = get_token_balance(tid)
+                    if actual_shares >= 1.0:
+                        pos["shares"] = round(actual_shares, 2)
                     resp = place_sell_order(tid, pos["shares"], cp, market_id=mid)
                     if resp is not None:
                         pnl = round((cp - entry) * pos["shares"], 2)
@@ -1081,6 +1164,12 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
                         pos["status"]     = "closed"
                         pos["closed_at"]  = now.isoformat()
                         save_market(mdata)
+                        state["total_bets"] += 1
+                        if pnl >= 0:
+                            state["wins"] += 1
+                        else:
+                            state["losses"] += 1
+                        state["total_pnl"] = round(state["total_pnl"] + pnl, 4)
                         print(f"  [{reason}] {slug} | entry ${entry:.3f} exit ${cp:.3f} | "
                               f"{minutes_left:.0f}m left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
                     else:
@@ -1088,6 +1177,9 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
             continue
 
         # --- Skip conditions for new entries ---
+        if len(open_slugs) + new_this_cycle >= MAX_OPEN_POSITIONS:
+            print(f"  [SKIP] {slug} — max open positions ({MAX_OPEN_POSITIONS}) reached")
+            continue
         if not (ENTRY_MIN_SEC <= seconds_to_end <= ENTRY_MAX_SEC):
             continue
         if mdata["coin_start_price"] is None:
@@ -1097,6 +1189,14 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
             continue
         if mkt["liquidity"] < MIN_LIQUIDITY:
             print(f"  [SKIP] {slug} — liquidity ${mkt['liquidity']:.0f} < ${MIN_LIQUIDITY:.0f}")
+            continue
+
+        # --- Skip if market is already near-terminal (crowd consensus > 90%) ---
+        # When Up is priced at 0.95, the crowd has watched the full trajectory and
+        # is almost certainly right. Our GBM model would generate huge fake EV on
+        # the losing side — filter it out to avoid value traps.
+        if not (MARKET_MIN_PRICE <= mkt["up_price"] <= 1.0 - MARKET_MIN_PRICE):
+            print(f"  [SKIP] {slug} — market one-sided (Up={mkt['up_price']:.3f}), crowd consensus too strong")
             continue
 
         # --- Probability estimation ---
@@ -1117,17 +1217,35 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
             continue
 
         min_ev = _strategy["min_ev"]
-        if ev_up >= ev_down and ev_up >= min_ev:
+        model_favours_up = p_blended >= 0.5
+        if ev_up >= min_ev and model_favours_up:
             bet_side, token_id = "Up",   mkt["up_token_id"]
             entry_price, p_win, ev = up_price,   p_blended,       ev_up
-        elif ev_down >= min_ev:
+        elif ev_down >= min_ev and not model_favours_up:
             bet_side, token_id = "Down", mkt["down_token_id"]
             entry_price, p_win, ev = down_price, 1.0 - p_blended, ev_down
         else:
-            print(
-                f"  [SKIP] {slug} | drift={drift*100:+.3f}% | "
-                f"p_up={p_blended:.3f} | EV_up={ev_up:.3f} EV_down={ev_down:.3f} — no edge"
-            )
+            # Determine why we're skipping for the log
+            if model_favours_up and ev_up < min_ev:
+                reason = f"EV_up={ev_up:.3f} < min_ev — no edge"
+            elif not model_favours_up and ev_down < min_ev:
+                reason = f"EV_down={ev_down:.3f} < min_ev — no edge"
+            else:
+                reason = f"model/EV mismatch (p_up={p_blended:.3f}, EV_up={ev_up:.3f}, EV_down={ev_down:.3f})"
+            print(f"  [SKIP] {slug} | drift={drift*100:+.3f}% | {reason}")
+            # Record near-miss so the EV tuner can evaluate lower thresholds
+            best_ev_side = "Up" if model_favours_up else "Down"
+            best_ev_val  = ev_up if model_favours_up else ev_down
+            mdata["skipped_ev"] = {
+                "ev":       round(best_ev_val, 4),
+                "ev_up":    round(ev_up, 4),
+                "ev_down":  round(ev_down, 4),
+                "p":        round(p_blended, 4),
+                "side":     best_ev_side,
+                "price":    up_price if best_ev_side == "Up" else down_price,
+                "drift":    round(drift, 6),
+            }
+            save_market(mdata)
             continue
 
         kelly      = calc_kelly(p_win, entry_price)
@@ -1196,6 +1314,7 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
         position["order_id"] = resp.get("orderID") or resp.get("id", "")
         mdata["position"]    = position
         save_market(mdata)
+        new_this_cycle += 1
         print(f"        [OK] OrderID={position['order_id']}")
 
     return state
@@ -1287,17 +1406,23 @@ def monitor_positions() -> int:
 
         if minutes_left < 5:
             take_profit = TAKE_PROFIT_FINAL
-        else:
+        elif minutes_left < 8:
             take_profit = TAKE_PROFIT_SHORT
+        else:
+            take_profit = TAKE_PROFIT_LONG
 
         roi_threshold = entry * (1.0 + TAKE_PROFIT_ROI)
-        take_triggered = current_price >= take_profit or current_price >= roi_threshold
+        take_triggered = current_price >= max(take_profit, entry) or current_price >= roi_threshold
         stop_triggered = current_price <= stop
 
         if take_triggered or stop_triggered:
             tid = pos.get("token_id")
             if not tid:
                 tid = mkt.get("up_token_id") if pos["bet_side"] == "Up" else mkt.get("down_token_id")
+            # Use actual on-chain balance to correct for partial fills at entry
+            actual_shares = get_token_balance(tid)
+            if actual_shares >= 1.0:
+                pos["shares"] = round(actual_shares, 2)
             resp = place_sell_order(tid, pos["shares"], current_price, market_id=mid)
             if resp is not None:
                 pnl = round((current_price - entry) * pos["shares"], 2)
@@ -1318,6 +1443,12 @@ def monitor_positions() -> int:
                 pos["exit_price"] = current_price
                 pos["pnl"]        = pnl
                 pos["status"]     = "closed"
+                state["total_bets"] += 1
+                if pnl >= 0:
+                    state["wins"] += 1
+                else:
+                    state["losses"] += 1
+                state["total_pnl"] = round(state["total_pnl"] + pnl, 4)
                 closed += 1
                 mutated = True
                 print(f"  [{reason}] {mkt['slug']} | entry ${entry:.3f} exit ${current_price:.3f} | "
