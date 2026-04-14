@@ -9,6 +9,50 @@ canonical description of how the bot currently works.
 
 ---
 
+## v4.2 — Forecast-Exit Signal Fix (2026-04-14)
+
+### Why This Change Was Made
+
+Post-v4.1 analysis found that `forecast_changed` was still exiting positions at near-entry
+prices — buying at 0.27 and selling at 0.24–0.26 after just 2–5 hours. Root cause:
+
+**The probability-based exit condition (`new_p < min_confidence`) fires on routine
+forecast noise.** With sigma=1.414 (the inverse-variance blend of two sigma=2.0 sources),
+a US 1°F bucket's probability ceiling is only ~0.49. A routine 2°F day-to-day forecast
+update drops `new_p` from 0.49 to ~0.32 — below `min_confidence=0.38` — triggering the
+exit on any 1-cent price dip.
+
+The original v4.0 spec (never correctly implemented) called for:
+> "Forecast moves ≥ 2° outside the bet bucket"
+
+This is a calibration-independent, temperature-based condition. It fires only when the
+forecast has genuinely moved beyond the bucket's edge, not when normal sigma uncertainty
+happens to straddle the threshold.
+
+### Bug Fixed
+
+#### `forecast_changed` — probability threshold too sensitive (critical)
+
+**Old condition:** `new_p < min_confidence AND current_price < entry_price`
+With `min_confidence=0.38` and `p_max≈0.49` for US 1°F buckets, any ~2°F forecast
+shift crossed the threshold. 7 of 15 exits were `forecast_changed` losses.
+
+**New condition:** `forecast is ≥ 2° outside bucket edge AND current_price < entry_price`
+- Bounded bucket `[t_low, t_high]`: triggers if `forecast < t_low − 2` or `forecast > t_high + 2`
+- Terminal "X or higher": triggers if `forecast < t_low − 2`
+- Terminal "X or below": triggers if `forecast > t_high + 2`
+
+The 2° buffer is in native units (°F for US, °C for EU). `new_p` is still computed
+and logged for diagnostics, but no longer drives the exit decision.
+
+### What Did Not Change
+
+- All other exit logic (take-profit, stop-loss, trailing stop, resolution)
+- Entry gates, re-entry gates, Kelly sizing
+- Config parameters
+
+---
+
 ## v4.1 — Bug-Fix Pass + Config Rebalance (2026-04-13)
 
 ### Why This Change Was Made

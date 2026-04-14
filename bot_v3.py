@@ -1218,13 +1218,17 @@ def scan_and_update():
                                 print(f"  [SELL FAIL] {loc['name']} {date} — will retry next cycle")
 
             # ---- FORECAST SHIFT EXIT ----
-            # Exit when the updated forecast drops the bucket's probability below
-            # min_confidence AND the position is already losing.
+            # Exit when the forecast has moved ≥ 2° OUTSIDE the bucket boundary
+            # AND the position is already losing.
             #
-            # Gating on "position is losing" is critical: we don't cut a winner
-            # because the forecast softened slightly — the take-profit will handle
-            # that. We only use this exit to escape a losing position whose model
-            # conviction has genuinely evaporated.
+            # Uses a temperature-based condition (original v4.0 design intent) rather
+            # than a probability threshold. With sigma=1.414 (blended), p_max is only
+            # ~0.49 for a 1°F bucket, so any routine 2°F forecast update drops p below
+            # min_confidence=0.38 and would fire on normal noise. Requiring the forecast
+            # to be ≥2° outside the bucket edge is a stable, calibration-independent gate.
+            #
+            # Terminal buckets ("X or higher" / "X or below") only test the relevant side.
+            # The 2° buffer is in native units (°F for US, °C for EU).
             pos = get_active_cycle(mkt)
             if pos is not None and forecast_temp is not None:
                 t_low   = pos["bucket_low"]
@@ -1234,10 +1238,17 @@ def scan_and_update():
                     (o["price"] for o in outcomes if o["market_id"] == pos["market_id"]),
                     None
                 )
-                # Trigger only when: model no longer supports min_confidence
-                #                AND the market is already moving against us
+                # Determine whether the forecast has genuinely left the bucket.
+                if t_high == 999:       # "X° or higher" terminal bucket
+                    fc_outside = forecast_temp < t_low - 2.0
+                elif t_low == -999:     # "X° or below" terminal bucket
+                    fc_outside = forecast_temp > t_high + 2.0
+                else:                   # bounded bucket
+                    fc_outside = forecast_temp < t_low - 2.0 or forecast_temp > t_high + 2.0
+
+                # Exit only when forecast is genuinely outside AND position is losing.
                 shifted = (
-                    new_p < _strategy["min_confidence"]
+                    fc_outside
                     and current_price is not None
                     and current_price < pos["entry_price"]
                 )
