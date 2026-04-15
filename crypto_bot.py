@@ -28,6 +28,21 @@ import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+
+def _utc_to_et(dt_utc: datetime) -> datetime:
+    """Convert a UTC datetime to Eastern Time (EDT/EST), no external dependencies.
+    DST rules (US, post-2007):
+      Start: second Sunday of March  at 07:00 UTC (02:00 EST → 03:00 EDT)
+      End:   first  Sunday of November at 06:00 UTC (02:00 EDT → 01:00 EST)
+    """
+    year = dt_utc.year
+    mar1 = datetime(year, 3,  1, tzinfo=timezone.utc)
+    nov1 = datetime(year, 11, 1, tzinfo=timezone.utc)
+    edt_start = mar1 + timedelta(days=(6 - mar1.weekday()) % 7 + 7, hours=7)
+    edt_end   = nov1 + timedelta(days=(6 - nov1.weekday()) % 7,      hours=6)
+    offset = timedelta(hours=-4) if edt_start <= dt_utc < edt_end else timedelta(hours=-5)
+    return dt_utc + offset
+
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     MarketOrderArgs, OrderArgs, OrderType, ApiCreds,
@@ -44,34 +59,34 @@ from llm_advisor import build_context, assess_cycle, NEUTRAL_ASSESSMENT
 
 COIN_DEFAULTS = {
     "BTC": {
-        "slug_prefix":      "btc",
+        "slug_prefix":      "bitcoin",
         "binance_symbol":   "BTCUSDT",
         "news_category":    "BTC",
         "annual_vol":       0.60,
         "min_ev":           0.06,
-        "min_drift":        0.001,
+        "min_drift":        0.002,
         "kelly_fraction":   0.25,
         "max_bet":          25.0,
         "min_liquidity":    300.0,
     },
     "ETH": {
-        "slug_prefix":      "eth",
+        "slug_prefix":      "ethereum",
         "binance_symbol":   "ETHUSDT",
         "news_category":    "ETH",
         "annual_vol":       0.80,   # ETH is more volatile than BTC
         "min_ev":           0.06,
-        "min_drift":        0.001,
+        "min_drift":        0.002,
         "kelly_fraction":   0.25,
         "max_bet":          25.0,
         "min_liquidity":    300.0,
     },
     "SOL": {
-        "slug_prefix":      "sol",
+        "slug_prefix":      "solana",
         "binance_symbol":   "SOLUSDT",
         "news_category":    "SOL",
         "annual_vol":       1.20,   # SOL is significantly more volatile
         "min_ev":           0.06,
-        "min_drift":        0.002,  # needs a larger drift given higher vol
+        "min_drift":        0.005,  # scaled up for 1-hour window
         "kelly_fraction":   0.20,   # slightly conservative for higher vol
         "max_bet":          25.0,
         "min_liquidity":    200.0,
@@ -82,7 +97,7 @@ COIN_DEFAULTS = {
         "news_category":    "XRP",
         "annual_vol":       0.90,
         "min_ev":           0.06,
-        "min_drift":        0.001,
+        "min_drift":        0.002,
         "kelly_fraction":   0.25,
         "max_bet":          25.0,
         "min_liquidity":    200.0,
@@ -199,7 +214,7 @@ _TUNE_BOUNDS = {
     "annual_vol":     (0.20, 3.00),
     "kelly_fraction": (0.05, 0.40),
     "min_ev":         (0.03, 0.25),
-    "min_drift":      (0.0005, 0.015),
+    "min_drift":      (0.001, 0.015),
 }
 _TUNE_MAX_STEP = 0.15
 
@@ -435,10 +450,20 @@ def _parse_json_field(raw, default):
 
 
 def _upcoming_slugs(count: int = 4) -> list[str]:
-    """Construct upcoming slugs from 15-min boundary timestamps."""
-    now_ts  = int(datetime.now(timezone.utc).timestamp())
-    current = (now_ts // 900) * 900
-    return [f"{SLUG_PREFIX}-updown-15m-{current + i * 900}" for i in range(count)]
+    """Construct upcoming slugs using Polymarket's named date format (Eastern Time).
+    Example: bitcoin-up-or-down-april-15-2026-3pm-et
+    """
+    base = _utc_to_et(datetime.now(timezone.utc)).replace(minute=0, second=0, microsecond=0)
+    slugs = []
+    for i in range(count):
+        dt   = base + timedelta(hours=i)
+        hour = dt.hour % 12 or 12              # 1-12, no leading zero
+        ampm = "am" if dt.hour < 12 else "pm"
+        slug = (f"{SLUG_PREFIX}-up-or-down-"
+                f"{dt.strftime('%B').lower()}-{dt.day}-{dt.year}-"
+                f"{hour}{ampm}-et")
+        slugs.append(slug)
+    return slugs
 
 
 def find_active_markets() -> list[dict]:
@@ -494,12 +519,12 @@ def find_active_markets() -> list[dict]:
             try:
                 start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
             except Exception:
-                start_dt = end_dt - timedelta(seconds=900)
+                start_dt = end_dt - timedelta(seconds=3600)
         else:
             try:
                 start_dt = datetime.fromtimestamp(int(slug.split("-")[-1]), tz=timezone.utc)
             except Exception:
-                start_dt = end_dt - timedelta(seconds=900)
+                start_dt = end_dt - timedelta(seconds=3600)
 
         seconds_to_end = (end_dt - now).total_seconds()
         if seconds_to_end < 0:
@@ -606,7 +631,7 @@ def _sample_price_history(points: list[dict], target: int, lookback_seconds: int
     return result
 
 
-def fetch_market_price_history(token_id: str, lookback_minutes: int = 30) -> list[dict]:
+def fetch_market_price_history(token_id: str, lookback_minutes: int = 120) -> list[dict]:
     """
     Fetch the Polymarket CLOB price trajectory for an Up token over the last
     `lookback_minutes` minutes, downsampled to ~8 points.
@@ -690,14 +715,14 @@ def estimate_p_up_technical(signals: dict) -> float:
 def p_up_given_drift(drift: float, seconds_remaining: float) -> float:
     """
     GBM P(Up | drift, time_remaining).
-    sigma_15min = annual_vol / sqrt(365 * 96)  — coin trades 24/7.
+    sigma_1hr = annual_vol / sqrt(365 * 24)  — coin trades 24/7.
     Higher annual_vol (e.g. SOL at 1.2) means we need a larger drift
     to get high confidence — correctly making the model more selective.
     """
     if seconds_remaining <= 0:
         return 1.0 if drift >= 0 else 0.0
-    sigma_15min     = _strategy["annual_vol"] / math.sqrt(365 * 96)
-    sigma_remaining = sigma_15min * math.sqrt(seconds_remaining / 900.0)
+    sigma_1hr       = _strategy["annual_vol"] / math.sqrt(365 * 24)
+    sigma_remaining = sigma_1hr * math.sqrt(seconds_remaining / 3600.0)
     if sigma_remaining <= 0:
         return 1.0 if drift >= 0 else 0.0
     return norm_cdf(drift / sigma_remaining)
@@ -921,7 +946,7 @@ def run_calibration(markets: list[dict]) -> None:
 
     mean_abs  = sum(realized_returns) / len(realized_returns)
     # E[|X|] = sigma * sqrt(2/pi) for N(0,sigma), so sigma = mean_abs * sqrt(pi/2)
-    realized_annual = mean_abs * math.sqrt(math.pi / 2.0) * math.sqrt(365 * 96)
+    realized_annual = mean_abs * math.sqrt(math.pi / 2.0) * math.sqrt(365 * 24)
 
     prior_vol = _strategy["annual_vol"]
     n         = len(realized_returns)
@@ -940,12 +965,12 @@ def run_calibration(markets: list[dict]) -> None:
     cal["annual_vol"] = {
         "value":        new_vol,
         "n":            n,
-        "mean_15m_abs": round(mean_abs * 100, 4),
+        "mean_1h_abs":  round(mean_abs * 100, 4),
         "updated_at":   datetime.now(timezone.utc).isoformat(),
     }
     CALIBRATION_FILE.write_text(json.dumps(cal, indent=2), encoding="utf-8")
     if changed:
-        print(f"  [CAL] {COIN} annual_vol: {prior_vol:.3f} → {new_vol:.3f}  (n={n}, mean_15m={mean_abs*100:.3f}%)")
+        print(f"  [CAL] {COIN} annual_vol: {prior_vol:.3f} → {new_vol:.3f}  (n={n}, mean_1h={mean_abs*100:.3f}%)")
 
 
 def _position_won(pos: dict) -> bool:
@@ -1037,7 +1062,7 @@ def tune_strategy(markets: list[dict]) -> None:
         max(_TUNE_BOUNDS["min_ev"][0], min(_TUNE_BOUNDS["min_ev"][1], current + capped)), 4)
 
     # 3. min_drift — best-performing drift band at entry
-    drift_thresholds = [0.0005, 0.001, 0.002, 0.003, 0.005, 0.008]
+    drift_thresholds = [0.002, 0.003, 0.005, 0.008, 0.010, 0.015]
     best_drift, best_drift_score = _strategy["min_drift"], -999.0
     for thresh in drift_thresholds:
         group = [m for m in recent if abs(m["position"].get("drift_at_entry", 0)) >= thresh]
@@ -1083,7 +1108,7 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
 
     markets = find_active_markets()
     if not markets:
-        print(f"  No active {COIN} 15-min markets found.")
+        print(f"  No active {COIN} 1-hour markets found.")
         return state
 
     price_state = fetch_price_state()
@@ -1187,7 +1212,7 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
 
         if mdata["coin_start_price"] is None and now >= start_dt:
             try:
-                start_epoch = int(slug.split("-")[-1])
+                start_epoch = int(start_dt.timestamp())
                 hist = fetch_historical_open(start_epoch)
             except Exception:
                 hist = None
@@ -1261,9 +1286,9 @@ def run_scan(state: dict, dry_run: bool = False, paper_mode: bool = False) -> di
                     pos["trailing_activated"] = True
 
                 minutes_left = seconds_to_end / 60.0
-                if minutes_left < 5:
+                if minutes_left < 10:
                     take_profit = TAKE_PROFIT_FINAL
-                elif minutes_left < 8:
+                elif minutes_left < 20:
                     take_profit = TAKE_PROFIT_SHORT
                 else:
                     take_profit = TAKE_PROFIT_LONG
@@ -1549,7 +1574,7 @@ def monitor_positions() -> int:
             end_dt = datetime.fromisoformat(mkt["event_end"].replace("Z", "+00:00"))
             seconds_left = max(0, (end_dt - now).total_seconds())
         except Exception:
-            seconds_left = 900.0
+            seconds_left = 3600.0
         minutes_left = seconds_left / 60.0
 
         if current_price >= entry * 1.20 and stop < entry:
@@ -1630,7 +1655,7 @@ def cmd_find() -> None:
     price       = price_state["current_price"]
     mkts        = find_active_markets()
     print(f"\n{COIN}: ${price:,.4f}")
-    print(f"Active 15-min markets: {len(mkts)}\n")
+    print(f"Active 1-hour markets: {len(mkts)}\n")
     for m in mkts:
         mdata     = load_market(m["slug"]) or {}
         start_p   = mdata.get("coin_start_price")

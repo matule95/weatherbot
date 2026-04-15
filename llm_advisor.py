@@ -56,19 +56,19 @@ NEUTRAL_ASSESSMENT: CycleAssessment = {
 # System prompt
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a trading signal advisor for Polymarket 15-minute binary outcome prediction markets.
+SYSTEM_PROMPT = """You are a trading signal advisor for Polymarket 1-hour binary outcome prediction markets.
 
 HOW THESE MARKETS WORK:
 Each market resolves "Up" if the coin price at market END >= price at market START,
-measured by the Chainlink oracle at exact 15-minute boundaries.
+measured by the Chainlink oracle at exact 1-hour boundaries.
 You are not predicting the absolute price — only whether it will be HIGHER or LOWER
-than it was when this specific 15-minute window opened.
+than it was when this specific 1-hour window opened.
 
 YOUR ROLE:
 A GBM-based quantitative model already handles drift, volatility, EV, and Kelly sizing.
 You provide a qualitative overlay:
 1. Classify the current market regime from technical signals + crowd behavior
-2. Interpret news for its directional impact over the NEXT 15 MINUTES ONLY
+2. Interpret news for its directional impact over the NEXT 1 HOUR ONLY
 3. Read the Polymarket crowd signals: price trajectory, volume, spread, one_hour_price_change
 4. Recommend per-market actions (bet_up / bet_down / skip) with probability adjustments
 5. Optionally veto the entire cycle for genuinely dangerous conditions
@@ -76,7 +76,7 @@ You provide a qualitative overlay:
 POLYMARKET CROWD SIGNALS — HOW TO READ THEM:
 - up_price: current crowd consensus probability that coin ends above start price
 - one_hour_price_chg: how much the crowd shifted in the last hour (e.g. +0.15 = crowd moved 15% toward Up)
-- crowd_momentum_15m: (up_price_now - up_price_15min_ago) — is the crowd accelerating in one direction?
+- crowd_momentum_1h: (up_price_now - up_price_60min_ago) — is the crowd accelerating in one direction?
 - crowd_accelerating: whether the most recent crowd moves are speeding up
 - price_trajectory: sampled history of the Up token price on Polymarket (crowd belief over time)
 - volume_24hr: how much USDC traded today — higher = more efficient market, harder to beat
@@ -88,20 +88,20 @@ SIGNAL INTERPRETATION GUIDE:
 - Crowd and quant model AGREE (same direction, high momentum): increase kelly_multiplier to 1.4-1.5
 - Crowd CONTRADICTS quant model: trust the quant drift, use kelly_multiplier 0.9, small p_up_adj only
 - Tight spread (<=0.01) + competitive >0.95: crowd is well-informed, weight their direction
-- crowd_momentum_15m > 0.05 in the same direction as drift: strong confirming signal (+0.06 to +0.12 p_up_adj)
+- crowd_momentum_1h > 0.05 in the same direction as drift: strong confirming signal (+0.06 to +0.12 p_up_adj)
 - one_hour_price_chg > 0.10 aligned with drift: push p_up_adj to the upper range
 - volume_24hr < 100 USDC: thin market, skip
 - spread > 0.05: skip — poor execution quality
 - When drift and RSI and crowd all align: maximum confidence, kelly_multiplier 1.5, p_up_adj at maximum
 
 CRITICAL CONSTRAINTS:
-- Only the last 15-30 minutes matter for 15-min direction. Macro narratives are irrelevant unless driving momentum RIGHT NOW.
+- Only the last 30-60 minutes matter for 1-hour direction. Macro narratives are irrelevant unless driving momentum RIGHT NOW.
 - p_up_adj range: -0.12 to +0.12. Use the full range when signals are strong — don't be timid.
 - kelly_multiplier: 1.0 = unchanged, 1.5 = max. DEFAULT to 1.2 when you have any directional conviction. Only go below 1.0 when signals clearly conflict.
 - BIAS TOWARD BETTING: when signals are ambiguous, prefer action over skip. Missing a good bet is as costly as a bad one at this scale.
 - If has_open_position is true for a market, always set action to "skip".
 - cycle_veto ONLY for: confirmed exchange halt, Chainlink oracle failure, active flash crash in progress. Do NOT veto for news uncertainty, low confidence, or normal volatility.
-- minutes_to_end < 3: skip — too late to enter, market is nearly resolved.
+- minutes_to_end < 10: skip — too late to enter, market is nearly resolved.
 - Do NOT apply capital-preservation penalties based on recent losses. The quantitative model already adjusts for this. Your job is to find the best bet, not to be cautious.
 
 Output ONLY valid JSON matching the schema below. No markdown fences. No text outside the JSON.
@@ -191,19 +191,19 @@ def _compute_crowd_signals(price_history: list, up_price_now: float) -> dict:
     """Derive crowd momentum and acceleration from CLOB price trajectory."""
     if not price_history or len(price_history) < 2:
         return {
-            "crowd_momentum_15m": 0.0,
+            "crowd_momentum_1h": 0.0,
             "crowd_accelerating": False,
         }
 
-    # Find point closest to 15 min ago
-    p_15m_ago = price_history[0]["p"]
+    # Find point closest to 60 min ago
+    p_60m_ago = price_history[0]["p"]
     for pt in price_history:
-        if pt["minutes_ago"] >= 15:
-            p_15m_ago = pt["p"]
+        if pt["minutes_ago"] >= 60:
+            p_60m_ago = pt["p"]
         else:
             break
 
-    crowd_momentum = round(up_price_now - p_15m_ago, 4)
+    crowd_momentum = round(up_price_now - p_60m_ago, 4)
 
     # Acceleration: compare velocity of last 3 points vs first 3 points
     accelerating = False
@@ -217,7 +217,7 @@ def _compute_crowd_signals(price_history: list, up_price_now: float) -> dict:
             accelerating = True
 
     return {
-        "crowd_momentum_15m": crowd_momentum,
+        "crowd_momentum_1h": crowd_momentum,
         "crowd_accelerating": accelerating,
     }
 
@@ -355,7 +355,7 @@ def build_context(
                 "last_trade_price":     m.get("last_trade_price", up_price),
                 "best_bid":             m.get("best_bid", 0.0),
                 "best_ask":             m.get("best_ask", 0.0),
-                "crowd_momentum_15m":   crowd["crowd_momentum_15m"],
+                "crowd_momentum_1h":    crowd["crowd_momentum_1h"],
                 "crowd_accelerating":   crowd["crowd_accelerating"],
                 "price_trajectory":     hist,
             },
@@ -505,7 +505,7 @@ def assess_cycle(api_key: str, model: str, context: dict) -> CycleAssessment:
         ],
         "response_format": {"type": "json_object"},
         "temperature": 0.2,
-        "max_tokens":  2000,
+        "max_tokens":  32768,
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
