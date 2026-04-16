@@ -9,6 +9,145 @@ canonical description of how the bot currently works.
 
 ---
 
+## v4.3 — Clean Rewrite: Model Agreement Gate + Forecast Exit Removal (2026-04-16)
+
+### Why This Change Was Made
+
+Post-mortem analysis of 17 live trades (11.8% win rate, −27% drawdown, −$5.28 net PnL)
+identified two dominant failure modes from the trade data:
+
+**1. `forecast_changed` exits on correct predictions.**
+Atlanta 2026-04-13: ECMWF=GFS=82°F, actual=82.1°F — the bucket was correct. A routine
+forecast update triggered `forecast_changed` → sold at −$0.26 when it would have resolved YES.
+
+**2. Entering markets where the two models disagree → wrong bucket selection.**
+Every trade where `|ECMWF − GFS| ≥ 3°F` resulted in a loss because neither model
+could be trusted to identify the right temperature bucket:
+
+| Market | ECMWF–GFS delta | Exit | PnL |
+|--------|----------------|------|-----|
+| seattle_2026-04-13 | 3°F | stop_loss | −$0.51 (actual was 3.6°F off) |
+| dallas_2026-04-14 | 4°F | forecast_changed | −$0.12 |
+| dallas_2026-04-15 | 3°F | stop_loss | **−$1.46** (largest single loss) |
+| miami_2026-04-15 | 3°F | forecast_changed | −$0.11 |
+
+**3. `get_hrrr()` was US-only and misnamed.** The function called `models=gfs_seamless` (GFS,
+not HRRR) and returned empty data for all EU cities — meaning London, Paris, Munich, and Ankara
+had no second-model comparison and no model_delta check possible.
+
+A backtest of the new gates against all 17 trades confirms:
+```
+BLOCKED 4 trades (all losses): PnL = −$2.20 (saved)
+ALLOWED 12 trades:              PnL = −$3.08
+Net:  −$3.08 vs actual −$5.28  (+$2.20 improvement, 42% fewer losses)
+```
+The remaining −$3.08 in allowed trades includes London (−$0.46) and Munich (−$1.60) which
+had no GFS data in v3 (EU was US-only). With the fix in v4.3, those markets now have
+model_delta values and may be blocked in future runs.
+
+### File
+
+`bot_v4.py` — clean rewrite. `bot_v3.py` is archived untouched.
+
+### Changes
+
+#### `forecast_changed` exit — removed entirely (critical)
+
+The exit fired when the forecast moved ≥2° outside the bucket boundary AND the position was
+losing. Even in its most conservative form, this caused the bot to sell correct predictions at
+a loss before resolution. The Atlanta case (correct bucket, exited −$0.26) is the clearest proof.
+
+**The market price already incorporates forecast updates.** If the forecast shifts adversarially,
+the price will fall and the stop-loss will eventually fire. A separate forecast-tracking exit adds
+no protective value and demonstrably creates losses.
+
+**New exit rules — price only:**
+
+| Trigger | Condition | Label |
+|---------|-----------|-------|
+| Take-profit | `current_price >= entry_price × (1 + take_profit_roi)` | `take_profit_roi` |
+| Stop-loss | `current_price <= entry_price × stop_loss_pct` | `stop_loss` |
+| Trailing stop | Once +20% above entry, stop rises to breakeven | `trailing_stop` |
+| Resolution | Polymarket settles YES/NO | `resolved` |
+
+#### Model agreement gate (new, critical)
+
+Block entry for the entire market if `|ECMWF − GFS| > max_model_delta` (default 2.0°F/°C).
+
+Applied before any bucket-level checks. When the two independent models disagree by more than
+the gate threshold, neither can be trusted to identify the correct 1–2° bucket. All four
+gated losses in the backtest had deltas of 3–4°F.
+
+```
+Gate order in find_best_entry():
+  0. MODEL AGREEMENT: |ECMWF − GFS| <= max_model_delta  → return None if fails
+  1. ZONE:            min_entry_price <= price <= max_entry_price
+  2. MIN EDGE:        P − market_price >= min_edge
+  3. CONFIDENCE:      P >= min_confidence
+  4. VOLUME:          >= min_volume                        (data gate — continue)
+  5. PRICE TREND:     flat or rising                       (data gate — continue)
+  6. BET SIZE:        Kelly size >= min_bet                (data gate — continue)
+```
+
+#### Minimum edge gate (new, replaces min_ev)
+
+`P − market_price >= min_edge` (default 0.10) replaces the old `EV >= min_ev` (0.05) gate.
+
+The old EV gate required only that our model assigns 5% more probability than the price implies
+(`p >= price × 1.05`). The new edge gate requires a 10 percentage-point absolute gap above the
+market price (`p >= price + 0.10`). At price=0.40 this means p ≥ 0.50; at price=0.35, p ≥ 0.45.
+
+EV is still computed and stored in the cycle record for diagnostics, but no longer gates entry.
+
+#### `get_hrrr()` → `get_gfs()` (renamed + global)
+
+The function was calling `models=gfs_seamless` while named `get_hrrr()`. It was also restricted
+to US-only cities (`if loc["region"] != "us": return {}`), leaving EU markets with zero second-model data.
+
+**Fix:** Renamed `get_gfs()`. Removed the US-only restriction. Uses the city's native temperature
+unit (Fahrenheit for US, Celsius for EU). Forecast window extended from 3 to 7 days to match ECMWF.
+
+Forecast snapshots still store GFS data under the key `"hrrr"` for backward compatibility with
+`run_calibration()` and existing market files.
+
+#### `get_metar()` — retry added
+
+Added 3× retry with 2-second sleep between attempts. The function previously returned None on
+the first timeout or empty response.
+
+#### Cycle records — new diagnostic fields
+
+Every cycle now stores:
+- `ecmwf_at_entry`: ECMWF temperature at entry time
+- `gfs_at_entry`: GFS temperature at entry time
+- `model_delta`: `|ECMWF − GFS|` at entry time (for post-mortem analysis)
+- `edge`: `P − market_price` at entry time
+
+Every forecast snapshot now stores `model_delta` alongside the existing fields.
+
+### New Config Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `max_model_delta` | 2.0 | Block entry if \|ECMWF − GFS\| exceeds this (°F for US, °C for EU) |
+| `min_edge` | 0.10 | Minimum (P − market_price) required to enter |
+
+### Removed Config Parameters
+
+`min_ev` — replaced by `min_edge`. EV is still computed and logged but no longer gates entry.
+
+### What Did Not Change
+
+- Core strategy: confidence-first, highest-probability bucket, opportunity zone [0.25, 0.65]
+- Take-profit at 35% ROI, stop-loss at 25% loss, trailing stop activates at +20%
+- Kelly sizing, calibration (Bayesian sigma), auto-tuner
+- Reconciliation, auto-resolution, re-entry logic
+- All Polymarket API calls
+- `bucket_prob()`, `calc_kelly()`, `bet_size()`, `calc_ev()` math functions
+- Scan regions: US + EU
+
+---
+
 ## v4.2 — Forecast-Exit Signal Fix (2026-04-14)
 
 ### Why This Change Was Made
