@@ -9,6 +9,244 @@ canonical description of how the bot currently works.
 
 ---
 
+## v4.5 — Cycle-Based Convergence Strategy + True Trailing Stop (2026-04-16)
+
+### Why This Change Was Made
+
+Live data from the first v4.3/v4.4 run (9 markets scanned, 1 entry, 2 stop-losses) surfaced two
+problems: a gate configuration that blocked valid entries, and a trailing stop that ejected
+profitable positions on normal price noise.
+
+**Problem 1 — Gate over-tightness (1 of 9 markets entered).**
+
+Post-scan gate analysis found three gates blocking 8 valid candidates:
+
+| Gate | Old value | Blocked markets |
+|------|-----------|-----------------|
+| `min_entry_price` | 0.25 | Paris $0.20, Seattle $0.105, NYC $0.23, Chicago $0.089 |
+| `min_edge` | 0.10 | London edge=0.096 (4bp short) |
+| `kelly_fraction` | 0.30 | Atlanta $0.60, Miami $0.90, Munich $0.57 — all below $1.00 min_bet |
+
+These were not marginal markets: Paris had P=60%, Seattle P=55%, London edge=9.6%. The gates
+were calibrated for a different strategy and did not reflect actual opportunity characteristics.
+
+**Problem 2 — Paris sold at $0.00 PnL despite being up +20%.**
+
+The trailing stop triggered because it locked `stop_price` to exactly `entry_price` ($0.22)
+when price hit `entry × 1.20 = $0.264`. Thin-market liquidity noise brought price back to
+$0.22 in the next monitor cycle — triggering a stop at breakeven with zero gain.
+
+Root cause: "lock to breakeven at +20%" is too tight for prediction markets. A 10–20% intraday
+price swing is normal in thin-liquidity Polymarket books. The stop needed to be wider and
+follow the price dynamically, not snap to a fixed level.
+
+**Problem 3 — Strategy misalignment: edge-finder vs temperature predictor.**
+
+Deeper analysis revealed the bot was functioning as an edge-finder (looking for market mispricing
+vs model P) but the market also uses ECMWF/GFS data — so the "edge" on any given day is close
+to zero by construction. Polymarket resolves on Wunderground station data (whole-integer degrees,
+station-specific), not grid-cell averages. Grid models can be systematically cold- or warm-biased
+vs the resolution station.
+
+The real opportunity is **convergence**: temperature prediction markets are underpriced early
+(0.10–0.35) when uncertainty is high and concentrate toward 0.80–0.95 as resolution approaches
+and station-specific data confirms the forecast. The correct strategy is to enter early at a
+cheap price, ride the convergence, take profit when the share price doubles, then re-enter for
+another convergence cycle — up to 3× per market.
+
+### Changes
+
+#### Config gate relaxation (3 parameters)
+
+| Parameter | Old | New | Reason |
+|-----------|-----|-----|--------|
+| `min_entry_price` | 0.25 | 0.10 | Valid-edge buckets exist at 0.10–0.24; low price alone is not a disqualifier when P ≥ min_confidence and edge ≥ min_edge |
+| `min_edge` | 0.10 | 0.06 | London (edge=0.096) and comparable markets were blocked by 4bp; 0.06 requires meaningful gap without over-filtering |
+| `kelly_fraction` | 0.30 | 0.40 | 30% Kelly produced sub-$1.00 bets (Polymarket floor), blocking entries with real edge |
+
+#### `take_profit_roi` changed to 1.0 (cycle-based convergence)
+
+**Old:** 0.35 — sell when price rises 35% above entry.
+
+**New:** 1.0 — sell when share price doubles (+100% ROI).
+
+Rationale: Prediction markets converge from 0.15–0.35 entry prices toward 0.80–0.95 at resolution
+for correct buckets. A 35% exit captures $0.05–$0.12 on a $0.20 entry and leaves most of the
+convergence gain on the table. A 100% ROI target captures the full convergence move while still
+allowing re-entry for subsequent cycles on the same market.
+
+Risk/reward improved from **0.7:1** (35% gain vs 50% loss, breakeven at 59% win rate) to
+**2:1** (100% gain vs 50% loss, breakeven at 33.3% win rate).
+
+#### True trailing stop (replaces lock-to-breakeven)
+
+**Old behavior:** When `current_price >= entry × 1.20`, set `stop_price = entry_price`. This
+locks the stop at exactly breakeven, so any price wobble back to entry triggers the stop.
+
+**New behavior:** Track `peak_price` continuously. When `current_price >= entry × TRAILING_ACTIVATION`
+(1.50 = +50%), the trailing stop activates and follows:
+
+```
+stop = peak_price × (1 − TRAILING_DISTANCE)   # TRAILING_DISTANCE = 0.30
+```
+
+The stop rises as price rises and never decreases. It only fires if price drops 30% from its
+highest point — not 30% from entry, but 30% from the peak it reached.
+
+Key constants:
+- `TRAILING_ACTIVATION = 1.50` — stop activates only after price reaches entry × 1.50 (+50%)
+- `TRAILING_DISTANCE = 0.30` — stop trails 30% below the peak price
+
+At a $0.22 entry:
+- Trailing activates when price reaches $0.33 (+50%)
+- If price peaks at $0.40, stop locks at $0.28 (entry × 1.27 — above breakeven)
+- If price continues to $0.50, stop rises to $0.35
+- Price must drop 30% from its peak to trigger — normal noise (10–20%) does not fire the stop
+
+The take-profit at +100% fires well before the trailing stop in most convergence scenarios, so
+the trailing stop acts as a safety net for partial convergence or unexpected reversals, not as
+the primary exit mechanism.
+
+#### Cycle re-entry strategy
+
+Up to `max_cycles_per_market = 3` re-entries per market. Each cycle:
+1. Enters at cheap price (0.10–0.35) when P ≥ min_confidence and edge ≥ min_edge
+2. Holds through convergence
+3. Takes profit at +100% ROI (share price doubles)
+4. Re-enters same bucket (if still hours remaining and conditions pass re-entry gates)
+5. Stop-loss at −50% acts as backstop for each cycle independently
+
+### Current State After v4.5
+
+```
+Strategy:    Cycle-based convergence. Enter when ECMWF and GFS agree (|delta| <= 2.0) AND
+             P − market_price >= 0.06. Take profit when share price doubles (+100% ROI).
+             Re-enter same market up to 3 cycles. Trailing stop activates at +50%, trails
+             30% below peak. Stop-loss at −50%. No forecast-based exits.
+
+min_entry_price:   0.10    (was 0.25)
+min_edge:          0.06    (was 0.10)
+kelly_fraction:    0.40    (was 0.30)
+take_profit_roi:   1.00    (was 0.35)
+stop_loss_pct:     0.50    (unchanged)
+TRAILING_ACTIVATION: 1.50  (was 1.20 implicit)
+TRAILING_DISTANCE:   0.30  (was 0.20)
+```
+
+---
+
+## v4.4 — Sigma Decovariance + Market-Consensus Gate (2026-04-16)
+
+### Why This Change Was Made
+
+Post-mortem of the Munich D+2 2026-04-18 trade — the first trade executed by v4.3 — identified
+three compounding failure modes that produced a bad entry despite all v4.3 gates passing.
+
+**The trade:** Munich 19°C bucket, entry at $0.200, P=44%, edge=+0.24, model Δ=0.3°C.
+- ECMWF: 19.1°C, GFS: 18.8°C → blended forecast: 18.9°C
+- Market consensus (19°C: 18.5¢, 20°C: 23¢, **21°C: 28¢**) implied ~20.3°C — 1.4°C warmer
+- At resolution, the market was correct and the position is a loser
+
+**Root cause 1 — sigma inflation from blending (primary).**
+`_blend_iv()` used the inverse-variance formula `σ = sqrt(1 / Σ(1/σᵢ²))` for blending sigma.
+This formula is correct only when sources are **independent**. ECMWF and GFS are not: they share
+physical equations, global observations, and fail in the same direction (~0.7–0.9 correlation).
+Treating them as independent collapsed σ from 1.2°C to 0.849°C — a 29% reduction:
+
+```
+σ=0.849  →  P(19°C) = 44%  → passes min_confidence=0.38  →  trade entered   ✗
+σ=1.200  →  P(19°C) = 32%  → below min_confidence=0.38   →  trade blocked   ✓
+```
+
+**Root cause 2 — price trend window too narrow.**
+`is_price_stable_or_rising()` compared only the last 2 market snapshots (window=2). The 19°C
+bucket's price fell 30% (0.235 → 0.160) between 12:32 and 16:23, then bounced slightly to 0.165
+by 17:17. The two-snapshot window saw the bounce (+12%) and passed. A four-snapshot window would
+have compared 14:32 (0.205) to 17:17 (0.165) — a 20% drop, below the 95% threshold, blocking entry.
+
+**Root cause 3 — market consensus ignored.**
+No gate compared the crowd's implied temperature to the model forecast. The market was pricing
+the distribution 1.4°C warmer than the model. For EU 1°C buckets, that disagreement spans
+more than one full bucket width and is a meaningful signal.
+
+### Changes
+
+#### `_blend_iv()` — sigma uses average variance, not IV formula (critical)
+
+**Old:** `blended_sigma = sqrt(1 / Σ(1/σᵢ²))` — IV formula, assumes source independence.
+
+**New:** `blended_sigma = sqrt(Σ(σᵢ²) / n)` — average variance, assumes ~0.5 correlation.
+
+For two sources with equal σ, the old formula gives `σ/√2`; the new formula gives `σ`.
+Temperature blending (the IV-weighted mean) is unchanged — only the sigma calculation changes.
+
+Effect on sigma and P for the Munich trade:
+
+| Formula | σ_blend | P(19°C) | Passes min_confidence=0.38 |
+|---------|---------|---------|---------------------------|
+| Old (IV — wrong) | 0.849°C | 44% | Yes → trade entered |
+| New (avg variance) | 1.200°C | 32% | No → blocked |
+
+METAR still provides genuine sigma reduction when present, because METAR is a real observation
+(an independent measurement) and the IV formula is valid for independent sources. The fix applies
+proportionally: two equal-sigma models produce no sigma reduction; adding METAR produces a modest
+reduction (e.g. σ=1.2 + σ_metar=1.0 blends to 1.104 instead of 0.921).
+
+#### `find_best_entry()` — trend window increased from 2 → 4 (gate 5)
+
+The 2-snapshot window is too short to catch a drop-then-bounce pattern. A 4-snapshot window
+compares the price 4 scans ago (approx. 4 hours) to the current price, making short-term
+bounces harder to use as false confirmation.
+
+Munich 19°C price history around entry:
+
+| Time | Price |
+|------|-------|
+| 14:32 | 0.205 |
+| 15:23 | 0.205 |
+| 16:23 | **0.160** (−22%) |
+| 17:17 | 0.165 |
+| 17:45 (entry) | 0.185 |
+
+Window=2 saw 0.165 → 0.185 (+12%) → passed. Window=4 sees 0.205 → 0.185 (−10%, below 95%) → blocked.
+
+#### `market_implied_temp()` + gate 0b — crowd-vs-model gap check (new)
+
+New function `market_implied_temp(outcomes)` computes the probability-weighted average of bucket
+midpoints across all outcomes, using market prices as weights. Terminal buckets (`≤X°` or `≥X°`)
+use their finite boundary as the midpoint proxy.
+
+New gate 0b in `find_best_entry()`: if `|market_implied_temp − forecast_temp| > 2 × max_model_delta`,
+block entry. At `max_model_delta=2.0°C`, the threshold is 4°C. This gate acts as a backstop for
+cases where the crowd is pricing a dramatically different scenario than the models (e.g. a surprise
+heatwave, local observation data not yet in the models, or a model initialization error).
+
+For the Munich trade: market implied 20.3°C vs model 18.9°C = 1.4°C gap — below the 4.0°C threshold,
+so gate 0b would not have blocked this trade independently. The gate becomes load-bearing for
+larger divergences. Fix 1 (sigma) and Fix 2 (trend window) are each individually sufficient.
+
+Updated gate order in `find_best_entry()`:
+
+```
+  0.  MODEL AGREEMENT:     |ECMWF − GFS| <= max_model_delta        → return None if fails
+  0b. MARKET CONSENSUS:    |market_implied − forecast| <= 2×max_model_delta  → return None if fails
+  1.  ZONE:                min_entry_price <= price <= max_entry_price
+  2.  MIN EDGE:            P − market_price >= min_edge
+  3.  CONFIDENCE:          P >= min_confidence
+  4.  VOLUME:              >= min_volume                             (data gate — continue)
+  5.  PRICE TREND:         flat or rising over last 4 scans          (data gate — continue)
+  6.  BET SIZE:            Kelly size >= min_bet                     (data gate — continue)
+```
+
+### What Did Not Change
+
+- Temperature blending formula (IV-weighted mean) — only the sigma formula changed
+- All other entry gates, re-entry logic, stop-loss, take-profit, trailing stop
+- Config parameters — no new parameters added (gate 0b threshold is derived from `max_model_delta`)
+- Kelly sizing, calibration, auto-tuner, reconciliation, Polymarket API calls
+
+---
+
 ## v4.3 — Clean Rewrite: Model Agreement Gate + Forecast Exit Removal (2026-04-16)
 
 ### Why This Change Was Made

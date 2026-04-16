@@ -82,6 +82,8 @@ MAX_OPEN_POS      = _cfg.get("max_open_positions", 10)
 MAX_POS_PER_DATE  = _cfg.get("max_positions_per_date", 5)
 MONITOR_INTERVAL  = _cfg.get("monitor_interval", 300)
 STOP_LOSS_PCT     = _cfg.get("stop_loss_pct", 0.75)
+TRAILING_DISTANCE   = 0.30   # trail stop this far below the peak price once trailing activates
+TRAILING_ACTIVATION = 1.50   # trailing activates once price reaches entry × this factor (+50%)
 SCAN_REGIONS      = set(_cfg.get("scan_regions", ["us", "eu"]))
 MAX_CYCLES        = _cfg.get("max_cycles_per_market", 3)
 MIN_BET           = _cfg.get("min_bet", 0.50)
@@ -571,7 +573,16 @@ def get_actual_temp(city_slug, date_str):
     return None
 
 def _blend_iv(temps_and_sigmas):
-    """Inverse-variance weighted blend of (temp, sigma) tuples."""
+    """Inverse-variance weighted blend of (temp, sigma) tuples.
+
+    Temperature: IV-weighted mean (correct — down-weights noisier sources).
+    Sigma: average variance (NOT IV). IV assumes independence, but ECMWF and GFS
+    are heavily correlated (~0.7-0.9) and share physics/observations. Treating them
+    as independent collapses sigma from 1.2 → 0.85, inflating P by ~12pp and pushing
+    marginal trades over the min_confidence gate. Average variance (ρ≈0.5 assumption)
+    is conservative and avoids false-precision: two identical-sigma sources blend to
+    the same sigma, not σ/√2.
+    """
     if not temps_and_sigmas:
         return None, None
     if len(temps_and_sigmas) == 1:
@@ -579,7 +590,7 @@ def _blend_iv(temps_and_sigmas):
     weights       = [1.0 / (s ** 2) for _, s in temps_and_sigmas]
     total_w       = sum(weights)
     blended_temp  = sum(t * w for (t, _), w in zip(temps_and_sigmas, weights)) / total_w
-    blended_sigma = math.sqrt(1.0 / total_w)
+    blended_sigma = math.sqrt(sum(s ** 2 for _, s in temps_and_sigmas) / len(temps_and_sigmas))
     return round(blended_temp, 1), round(blended_sigma, 3)
 
 def take_forecast_snapshot(city_slug, dates, horizon_map=None, metar_max=None):
@@ -843,6 +854,32 @@ def is_price_stable_or_rising(market_record, token_id, window=2):
     return prices[-1] >= prices[0] * 0.95
 
 
+def market_implied_temp(outcomes):
+    """
+    Compute the market-implied temperature as a probability-weighted average of
+    bucket midpoints. Terminal buckets use their finite boundary as the midpoint
+    proxy (e.g. "≤14°C" → 14, "≥24°C" → 24). Used as a cross-check against the
+    model forecast — large disagreements signal that the crowd knows something
+    the models don't.
+    """
+    total_price = 0.0
+    weighted    = 0.0
+    for o in outcomes:
+        t_low, t_high = o["range"]
+        price         = o.get("price", 0.0)
+        if t_low == -999:
+            midpoint = t_high
+        elif t_high == 999:
+            midpoint = t_low
+        else:
+            midpoint = (t_low + t_high) / 2.0
+        weighted    += midpoint * price
+        total_price += price
+    if total_price <= 0:
+        return None
+    return round(weighted / total_price, 1)
+
+
 def find_best_entry(outcomes, forecast_temp, sigma, balance, market_record,
                     model_delta=None):
     """
@@ -854,6 +891,9 @@ def find_best_entry(outcomes, forecast_temp, sigma, balance, market_record,
     Strategy gates (failures skip the market entirely — no fallback):
       0. Model agreement: |ECMWF - GFS| <= MAX_MODEL_DELTA — block entire market
          if models disagree. Data shows disagreement predicts wrong-bucket entries.
+      0b. Market-vs-model gap: if the market-implied temperature differs from the
+          model forecast by > 2 × MAX_MODEL_DELTA, the crowd is pricing a different
+          scenario. Block entry — the model is likely wrong.
       1. Price in opportunity zone: MIN_ENTRY_PRICE..MAX_ENTRY_PRICE
       2. Minimum edge: P - market_price >= MIN_EDGE (not just any positive EV)
       3. Confidence: P >= min_confidence
@@ -871,6 +911,16 @@ def find_best_entry(outcomes, forecast_temp, sigma, balance, market_record,
     # market untrustworthy, not just one bucket.
     if model_delta is not None and model_delta > MAX_MODEL_DELTA:
         return None
+
+    # Gate 0b: market-vs-model gap — if the crowd's implied temperature is more
+    # than 2 × MAX_MODEL_DELTA away from our forecast, the market knows something
+    # the models don't (e.g., local warming, recent observations). Block entry.
+    market_temp = market_implied_temp(outcomes)
+    if market_temp is not None:
+        crowd_gap = abs(market_temp - forecast_temp)
+        max_crowd_gap = 2.0 * MAX_MODEL_DELTA
+        if crowd_gap > max_crowd_gap:
+            return None
 
     min_conf = _strategy["min_confidence"]
 
@@ -914,7 +964,7 @@ def find_best_entry(outcomes, forecast_temp, sigma, balance, market_record,
             continue
 
         # Gate 5: price trend (flat or rising — falling prices = market moving against us)
-        if not is_price_stable_or_rising(market_record, o.get("token_id", ""), window=2):
+        if not is_price_stable_or_rising(market_record, o.get("token_id", ""), window=4):
             continue
 
         # Gate 6: minimum bet size after Kelly sizing
@@ -1200,6 +1250,7 @@ def scan_and_update():
                                 "order_id":           None,
                                 "stop_price":         round(entry * STOP_LOSS_PCT, 4),
                                 "trailing_activated": False,
+                                "peak_price":         None,
                                 "reconciled":         True,
                             })
                             break
@@ -1218,10 +1269,17 @@ def scan_and_update():
                     stop          = pos.get("stop_price", entry * STOP_LOSS_PCT)
                     roi_threshold = entry * (1.0 + _strategy["take_profit_roi"])
 
-                    # Raise stop to breakeven once we're up 20%
-                    if current_price >= entry * 1.20 and stop < entry:
-                        pos["stop_price"]         = entry
+                    # True trailing stop: once up 20%, trail TRAILING_DISTANCE below the peak.
+                    # Never locks to breakeven — stop follows the peak price downward at a distance,
+                    # so a small price wobble back to entry does not eject the position.
+                    if current_price >= entry * TRAILING_ACTIVATION or pos.get("trailing_activated"):
                         pos["trailing_activated"] = True
+                        peak     = max(current_price, pos.get("peak_price") or 0)
+                        pos["peak_price"] = peak
+                        new_stop = round(peak * (1 - TRAILING_DISTANCE), 4)
+                        if new_stop > stop:
+                            pos["stop_price"] = new_stop
+                            stop              = new_stop
 
                     take_triggered = current_price >= roi_threshold and current_price > entry
                     stop_triggered = current_price <= stop
@@ -1389,6 +1447,7 @@ def scan_and_update():
                                         "order_id":           resp.get("orderID", resp.get("orderId", "")),
                                         "stop_price":         round(candidate["entry_price"] * STOP_LOSS_PCT, 4),
                                         "trailing_activated": False,
+                                        "peak_price":         None,
                                         "reconciled":         False,
                                     })
                                     balance -= candidate["cost"]
@@ -1580,6 +1639,7 @@ def monitor_positions():
                 "order_id":           None,
                 "stop_price":         round(entry * STOP_LOSS_PCT, 4),
                 "trailing_activated": False,
+                "peak_price":         None,
                 "reconciled":         True,
             })
             save_market(mkt)
@@ -1626,12 +1686,19 @@ def monitor_positions():
         city_name     = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
         ts_now        = datetime.now(timezone.utc).isoformat()
 
-        # Update trailing stop
-        if current_price >= entry * 1.20 and stop < entry:
-            pos["stop_price"]         = entry
+        # True trailing stop: once up 20%, trail TRAILING_DISTANCE below the peak.
+        # Never locks to breakeven — stop follows the peak price downward at a distance,
+        # so a small price wobble back to entry does not eject the position.
+        if current_price >= entry * TRAILING_ACTIVATION or pos.get("trailing_activated"):
             pos["trailing_activated"] = True
-            mutated = True
-            print(f"  [TRAILING] {city_name} {mkt['date']} — stop raised to breakeven ${entry:.3f}")
+            peak     = max(current_price, pos.get("peak_price") or 0)
+            pos["peak_price"] = peak
+            new_stop = round(peak * (1 - TRAILING_DISTANCE), 4)
+            if new_stop > stop:
+                pos["stop_price"] = new_stop
+                stop              = new_stop
+                mutated = True
+                print(f"  [TRAILING] {city_name} {mkt['date']} — stop raised to ${new_stop:.3f} (peak ${peak:.3f})")
 
         take_triggered = current_price >= roi_threshold and current_price > entry
         stop_triggered = current_price <= stop
