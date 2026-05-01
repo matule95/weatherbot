@@ -9,6 +9,753 @@ canonical description of how the bot currently works.
 
 ---
 
+## v4.13 — Entry-Gate Recalibration for Volume (2026-05-01)
+
+### Why This Change Was Made
+
+The v4.12 sim run that followed the strategy overhaul (200 → 160 starting balance, sim reset 2026-04-30) produced **1 trade in 22 hours** — Tokyo 2026-05-02, which is sitting at +29% unrealized. Every other market was rejected at one of the entry gates. With zero closed cycles to learn from, the v4.12 design (forecast_diverged exit, bounded loss) cannot be validated.
+
+A full audit of all 56 active sim markets across the 21-snapshot history identified the dominant blocker as **a math conflict between `min_confidence = 0.50` and the bucket-probability ceiling**:
+
+- `sigma_C = 0.85` and 1°C-wide single buckets → maximum achievable bucket probability is `norm_cdf(0.5/0.85) − norm_cdf(−0.5/0.85) ≈ 0.444`
+- A `min_confidence` floor of 0.50 therefore mathematically banned every single-bucket entry
+- Only open-ended top/bottom buckets (`X°C-or-higher`, `X°C-or-below`) could ever clear the floor — that's why Tokyo got in (open `≥25°C` bucket at p=0.83) and nothing else did
+
+Two additional gates were over-tuned for the v4.11 loss model and not re-evaluated after v4.12 introduced bounded loss:
+
+- `max_model_delta_c = 1.1` was blocking 29 of 56 markets (over half), most for routine ECMWF/GFS spread of 1.2-1.8°C — that's normal model uncertainty, already accounted for in sigma
+- `max_crowd_gap_buckets = 1.0` was blocking 14 markets — but by construction, high crowd-gap = high mispricing = high edge. The blocked trades had edges of +0.25 to +0.33, the largest in the eligible set
+
+### Config Changes
+
+| Parameter | Old | New | Reason |
+|---|---|---|---|
+| `min_confidence` | 0.50 | **0.42** | Math fix — single-bucket entries cap at ~0.44, so 0.50 banned them entirely. v4.12's bounded-loss exit makes the old "67% breakeven" math obsolete. 0.42 sits just under the ceiling |
+| `max_model_delta_c` | 1.1 | **2.0** | Conceptual match with F's 2.0 cap. Routine ECMWF/GFS spread is 1.2-1.8°C and isn't a "wrong forecast" signal. Blocked 29/56 markets at the old value |
+| `max_crowd_gap_buckets` | 1.0 | **1.5** | The single biggest profit lever. Unblocks the highest-edge trades specifically (+0.25 to +0.33). v4.12's forecast_diverged() will exit at bounded loss if the crowd turns out to be right |
+
+### Why These Three (and Not Others)
+
+A 6-config historical sweep was run against every snapshot of every market. Results (number of distinct markets that would have produced an entry over the 21h sim window):
+
+| Config | Entries | Avg edge |
+|---|---|---|
+| Current v4.12 (0.50 / 1.1 / 1.0 / 0.10) | 0 | — |
+| min_conf 0.42 only | 14 | +0.174 |
+| + Δc 1.1→2.0 | 16 | +0.173 |
+| **v4.13 (0.42 / 2.0 / 1.5 / 0.10)** | **27** | **+0.211** |
+| + min_edge 0.10→0.07 | 28 | +0.202 (diluted) |
+| + min_conf 0.42→0.40 | 31 | +0.191 (diluted) |
+
+Lowering `min_edge` to 0.07 only adds 1 marginal trade and waters down avg edge. Lowering `min_conf` to 0.40 adds 3 lower-confidence trades that risk extra losses without proportional volume. The 27-entry / +0.211-avg-edge config is the local optimum for entry quality × volume.
+
+### What Did NOT Change
+
+- **`min_edge = 0.10`** — kept. Lowering to 0.07 was tested and adds one trade for diluted avg edge.
+- **`max_model_delta_f = 2.0`** — kept. Already at the conceptual equivalent of the new C value.
+- **`forecast_diverged()` tolerance, trailing stop distance, take_profit_roi, kelly_fraction, MAX_BET, position caps** — all unchanged. v4.13 is purely a gate recalibration, not a strategy change.
+- **Tuner stays disabled.** Re-enable after the v4.13 strategy has produced 30+ closed cycles to confirm calibration before letting the tuner adjust.
+
+### Expected Impact
+
+Capital constraints (sim balance $160, max_bet $40, ~6 concurrent $25 positions) cap actual entries at 5-8 open at a time, not all 27 historical eligibles. Expect the bot to fill its position book within the first scan cycle and then trickle-replace as positions close.
+
+If the model is calibrated (55% win rate at edges +0.10 to +0.33), EV math: `0.55 × $12.50 (TP) + 0.45 × −$10 (forecast_diverged exit) ≈ +$2.40 per trade`. At ~25 entries/day → ~$60/day → ~2.5 days to double the sim bankroll ($160 → $320).
+
+The central assumption being tested: **does `forecast_diverged()` actually bound losses as designed when forecasts move outside the bucket?** 18 of 57 markets had ≥1.5° forecast swings during the sim window, so this exit will fire often. If observed loss-per-stop is significantly worse than ~40% of bet size, the v4.12 thesis is wrong and we'll need to revisit min_confidence.
+
+### Current System State
+
+```python
+# Entry gates (v4.13):
+min_confidence       = 0.42    # was 0.50
+max_model_delta_f    = 2.0
+max_model_delta_c    = 2.0     # was 1.1
+max_crowd_gap_buckets = 1.5    # was 1.0
+min_edge             = 0.10
+min_entry_price      = 0.10
+max_entry_price      = 0.65
+min_volume           = 100
+
+# Exit logic (unchanged from v4.12):
+forecast_diverged(forecast, t_low, t_high, tolerance=0.5)
+take_profit_roi      = 0.50
+trailing_activation  = 1.25 × entry
+trailing_distance    = 0.30 of peak
+
+# Position sizing (unchanged):
+kelly_fraction       = 0.50
+max_bet              = 40.0
+max_open_positions   = 15
+max_positions_per_date = 5
+```
+
+---
+
+## v4.12 — Forecast-Divergence Exit + Unit-Aware Gates + Tuner Rewire (2026-05-01)
+
+### Why This Change Was Made
+
+The first ~50-trade sim run on the v4.11 strategy lost 53% of starting balance ($200 → $94.17, peak $239.55). Root-cause analysis on the closed cycles plus a deep trace of one stop-out (Munich 2026-04-29) identified four distinct architectural failures, each independently sufficient to make the strategy unprofitable.
+
+**Failure 1 — `stop_loss_pct = 0.625` is fictional in this market (critical).**
+
+The R:R math underpinning v4.11 (50% gain vs 37.5% loss → ~43% breakeven win rate) assumes orderly price decline. Weather-bucket prices on Polymarket do not decline orderly: they gap toward $0 at resolution if the actual temperature lands in a different bucket. Munich on 2026-04-29 entered the 17°C bucket at $0.31 with a ~$0.19 stop. The market priced 18°C at $0.58 throughout the day, the actual high was 18°C, and the bucket exit price snapped from $0.30 to $0.0005 between two scan snapshots — the "stop" captured a −99.8% loss, not −37.5%. Effective R:R is closer to **+50% : −100%**, which lifts the breakeven win rate to ~67%, not 43%. Sim observed 50% win rate and 50% stop rate, which guaranteed the drawdown.
+
+**Failure 2 — auto-tuner crushed `take_profit_roi` from 0.50 to 0.22 (critical).**
+
+`tune_strategy()` lowered TP whenever `stop_rate > 0.40`. Sim observed 50% stop rate, so the tuner ratcheted TP down ~10 times. With TP=0.22 and effective loss=−100%, breakeven jumps to **82% win rate** — mathematically unreachable. The down-branch was responding to a symptom (bad entries) by amplifying a different problem (shrinking wins).
+
+The kelly_fraction branch was also blind: it filtered for `close_reason == "resolved"` and there were zero resolved-to-outcome cycles in the dataset (every position exited via take-profit or stop before resolution day). Kelly was effectively frozen.
+
+**Failure 3 — `max_model_delta = 2.0` and `max_crowd_gap = 4.0` are unit-naive (high).**
+
+The same constant was used for °F (1°F-wide buckets) and °C (1°C-wide buckets). 2°C is 80% larger in physical terms than 2°F. EU markets received a much more permissive disagreement gate than US markets despite using the same bucket structure. Munich at entry: market-implied temperature ≈ 17.4°C, model forecast 16.6°C → crowd gap 0.8°C. The gate threshold was 4.0°C. The crowd was screaming "18°C" through nearly a full bucket of disagreement and the gate let it through.
+
+**Failure 4 — `min_confidence = 0.40` is below the actual profitable floor (high).**
+
+13 of the recent 20 cycles had `p ∈ [0.40, 0.45)`. Avg PnL: **−$2.51 per cycle**. The [0.45, 0.50) band was barely positive (avg −$1.33). With effective loss-per-stop near 100%, the math says you need calibrated win rate ≥ 67%, which means model `p` must be well above 0.50 even when calibrated. Entries at 0.40 cannot win in expectation regardless of edge.
+
+### What Changed
+
+#### `forecast_diverged()` replaces price-based stop_loss as the loss-side exit (critical)
+
+New helper at module scope:
+
+```python
+def forecast_diverged(forecast_temp, t_low, t_high, tolerance=0.5):
+    if forecast_temp is None or t_low is None or t_high is None:
+        return False
+    if t_low == -999:
+        return forecast_temp > t_high + tolerance
+    if t_high == 999:
+        return forecast_temp < t_low - tolerance
+    return forecast_temp < t_low - tolerance or forecast_temp > t_high + tolerance
+```
+
+A position exits when the bias-corrected forecast (which already includes WU `running_max` blended at low sigma when WU is up) moves more than 0.5 units outside the bucket's rounding window. This is the actual recoverable signal: by the time the corrected forecast clears the window, the bucket is unlikely to win and price will continue to decay. Critically, the exit fires while liquidity still exists — not after a resolution gap.
+
+**Scan-loop exit (`scan_and_update`):** three-way trigger — `take_profit_roi` (price ≥ entry × 1.50), `forecast_diverged`, or `trailing_stop` (price ≤ trailing level, only after trailing has activated). Pre-trailing positions can no longer fire a price-based stop. New `close_reason = "forecast_diverged"`.
+
+**Monitor-loop exit (`monitor_positions`):** two-way trigger — `take_profit_roi` or `trailing_stop`. The monitor loop has no fresh forecast; the divergence check runs only in the scan loop where the corrected forecast is recomputed. The `stop_loss` reason path is removed entirely.
+
+`STOP_LOSS_PCT` and the `stop_price` field are kept as the seed value for the trailing stop once a position has gone profitable. They are no longer load-bearing on the loss side.
+
+#### Tuner rewire (critical)
+
+Two changes inside `tune_strategy()`:
+
+1. **TP-down branch removed.** `take_profit_roi` is now a one-way ratchet — it can only increase, and only when `profit_rate > 0.60 AND stop_rate < 0.20`. The previous "lower TP when stop_rate is high" response is documented in the function docstring as the wrong fix for this market.
+
+2. **`resolved_only` filter dropped from kelly tuning.** Kelly now learns from any closed cycle with realised PnL, not only from cycles that resolved to outcome. The previous filter left kelly permanently inactive whenever the bot was take-profit / stop-active enough to never hold to resolution.
+
+`stop_n` (used by the surviving TP-up branch) now also counts `forecast_diverged` exits alongside `stop_loss` and `trailing_stop`, so the signal stays meaningful under the new exit semantics.
+
+`tune_enabled` is set to **false** in config until 30+ closed cycles accumulate under the new strategy. The damaged `strategy.json` was deleted as part of the reset.
+
+#### Unit-aware entry gates
+
+```python
+MAX_MODEL_DELTA_F   = _cfg.get("max_model_delta_f", 2.0)
+MAX_MODEL_DELTA_C   = _cfg.get("max_model_delta_c", 1.1)
+MAX_CROWD_GAP_BUCKS = _cfg.get("max_crowd_gap_buckets", 1.0)
+```
+
+`find_best_entry()` resolves the cap from the market's unit at call time:
+
+- Gate 0 (model agreement): `model_delta > model_delta_cap(unit)`. 1.1°C ≈ same number of buckets as 2.0°F.
+- Gate 0b (crowd gap): expressed in bucket-widths instead of absolute degrees. `1.0` = "the crowd is pricing one full bucket away from us." Replaces the previous `2 × max_model_delta` formula that produced a 4-bucket-wide threshold.
+
+Munich case re-evaluated under the new gates: crowd_gap 0.8 < 1.0 (still passes — Tier 2 alone does not block Munich). The combination of `forecast_diverged` exit + `min_confidence ≥ 0.50` + per-city circuit breaker (below) is what addresses the Munich loss profile.
+
+The legacy `MAX_MODEL_DELTA` symbol is retained as an alias for `MAX_MODEL_DELTA_F` so log lines and existing references continue to import. Per-call decisions resolve through `model_delta_cap(unit)`.
+
+#### Per-city circuit breaker
+
+```python
+def city_recently_lost(city_slug, all_markets, now, window_hours=None, limit=None):
+    # Returns True if >= limit negative-PnL closures for this city in the
+    # last window_hours, scanning across all that city's markets (not just
+    # one resolution date).
+```
+
+Wired into the entry path immediately after the portfolio caps in `scan_and_update`. Default thresholds:
+
+- `city_loss_limit = 2`
+- `city_loss_window_hours = 24`
+
+Munich on 2026-04-29 took three stop_losses within ~9 hours costing $25.98. Under this gate, the second loss pauses Munich entries for 24h — saving ~$13.
+
+#### Config changes
+
+| Parameter | v4.11 | v4.12 | Reason |
+|-----------|-------|-------|--------|
+| `min_confidence` | 0.40 | **0.50** | [0.40, 0.45) band averaged −$2.51/cycle in sim; model `p` must clear 0.50 to be profitable under the new R:R |
+| `min_edge` | 0.07 | **0.10** | Compensates for ~100% effective loss-per-stop |
+| `max_model_delta` | 2.0 | **removed** | Replaced by `max_model_delta_f` (2.0) + `max_model_delta_c` (1.1) |
+| `max_model_delta_f` | — | **2.0** | New |
+| `max_model_delta_c` | — | **1.1** | New — same number of buckets as °F |
+| `max_crowd_gap_buckets` | — | **1.0** | New — replaces implicit `2 × max_model_delta` |
+| `city_loss_limit` | — | **2** | New |
+| `city_loss_window_hours` | — | **24** | New |
+| `tune_enabled` | true | **false** | Tuner had pushed TP from 0.50 → 0.22; off until cycles accumulate |
+| `take_profit_roi` | 0.50 | 0.50 (unchanged in config; restored from broken-tuner 0.22) |  |
+
+`stop_loss_pct` is unchanged (0.625) but its `_notes` entry now describes it as legacy — the price-based stop is no longer the loss-side exit.
+
+#### Reset
+
+- `weather_bot_data/sim_state.json` — deleted.
+- `weather_bot_data/strategy.json` — deleted (held the broken tuned values).
+- `weather_bot_data/sim_markets/*.json` — 96 files deleted.
+- `weather_bot_data/calibration.json` — **kept**. Bias data is independent of strategy and represents 89-90 samples per city.
+- `weather_bot_data/markets/` — kept (real-money history).
+
+### What Did Not Change
+
+- Forecast pipeline: ECMWF + GFS bias correction, WU `running_max` blending, sigma calibration. Untouched.
+- `bucket_prob()`, `calc_kelly()`, `calc_ev()`, `bet_size()`. Untouched.
+- Trailing stop: still activates at +25%, still trails 30% below peak. The trailing logic correctly protects winners and the existing constants are unchanged.
+- Re-entry gate structure (`evaluate_reentry`): still requires last cycle profitable, fresh `p ≥ min_confidence`, current price below last exit, etc. Now also gated by the new model-delta cap (unit-aware) and the new per-city circuit breaker.
+- `min_confidence` tuner band-selection logic — kept intact, just no longer running while `tune_enabled = false`.
+- All Polymarket CLOB API calls, reconciliation, sim-mode plumbing, scan/monitor cadence, scan regions.
+
+### Current System State After v4.12
+
+```
+Loss-side exit:    forecast_diverged (>0.5 units outside bucket's rounding window)
+                   No price-based stop. Trailing stop still active for winners.
+Take-profit:       +50% ROI (entry × 1.50)
+Trailing stop:     activates at +25%, trails 30% below peak
+Entry gates:       model_delta <= 2.0°F / 1.1°C  (unit-aware)
+                   crowd_gap   <= 1.0 bucket-widths  (unit-aware)
+                   price       in [0.10, 0.65]
+                   min_edge    >= 0.10
+                   confidence  >= 0.50
+                   volume      >= MIN_VOLUME
+                   trend       flat or rising
+                   bet size    >= $1.00
+Re-entry:          all entry gates + last cycle profitable + price < last exit
+City circuit:      pause city for 24h after 2 negative-PnL exits
+Tuner:             disabled (re-enable after 30+ new cycles)
+Sim balance:       reset to $200 (sim_state.json deleted)
+```
+
+The strategy is structurally honest about how this market behaves: losses are not capped at 37.5%; they are capped at "exit price when the model has changed its mind." Entry quality is the load-bearing variable. The remaining tuner branches (kelly, min_confidence band selection, TP-up ratchet) are non-destructive and can be re-enabled once new-strategy data exists.
+
+---
+
+## v4.11 — 50% ROI Target + Trailing Stop Reactivation + R:R Rebalance (2026-04-22)
+
+### Why This Change Was Made
+
+The previous `take_profit_roi = 0.65` configuration had two structural problems:
+
+**Problem 1 — `max_entry_price = 0.75` was unreachable at 65% TP.**
+
+Polymarket shares cap at $1.00. The take-profit condition is `entry × (1 + take_profit_roi)`. At 65% TP, any entry above `$1.00 / 1.65 = $0.606` can mathematically never reach the target. With `max_entry_price = 0.75`, the bot was permitted to enter trades at prices where the take-profit was structurally impossible.
+
+**Problem 2 — `TRAILING_ACTIVATION = 1.50` was dead code at 65% TP.**
+
+The trailing stop activates at `entry × 1.50`. The take-profit fires at `entry × 1.65`. Price must pass through the trailing activation level to reach the TP — which means the trailing stop always had a chance to fire first, making the hard TP ceiling unreachable in most scenarios. The two exits competed instead of cooperating.
+
+Lowering TP to 50% fixes Problem 1 (new entry ceiling: $0.667) but creates an identical dead-code issue at the same activation level: both TP and trailing would fire at exactly `entry × 1.50`. The trailing stop would still be non-functional.
+
+**R:R degradation at 50% TP with unchanged SL.**
+
+Keeping `stop_loss_pct = 0.50` (50% max loss) at a 50% TP target produces a 1:1 R:R — breakeven requires a 50% win rate. The prior design at TP=65%/SL=50% gave a 1.3:1 R:R (breakeven at 43.5%). The stop-loss must tighten to restore a comparable R:R.
+
+### What Changed
+
+#### `take_profit_roi`: 0.65 → 0.50
+
+Target ROI reduced. At 50%, a trade entered at $0.40 takes profit at $0.60. Maximum viable entry price is now $1.00 / 1.50 = $0.667.
+
+#### `max_entry_price`: 0.75 → 0.65
+
+Corrected to match the 50% TP ceiling. Entries above $0.667 cannot reach the take-profit target. Set to $0.65 with a small buffer.
+
+#### `stop_loss_pct`: 0.50 → 0.625
+
+Stop fires at 62.5% of entry price — a 37.5% max loss per cycle instead of 50%. This restores a comparable R:R to the original design:
+
+| Config | TP | Max loss | R:R | Breakeven WR |
+|--------|----|----------|-----|--------------|
+| Previous | 65% | 50% | 1.30:1 | 43.5% |
+| **v4.11** | **50%** | **37.5%** | **1.33:1** | **~43%** |
+
+#### `min_edge`: 0.05 → 0.07
+
+Raised from 5pp to 7pp. At 1.33:1 R:R with ~43% breakeven win rate, marginal edges are insufficient. Raising the floor filters entries where the bot's probability advantage over the market is too thin to support that win rate requirement.
+
+#### `TRAILING_ACTIVATION` (code): 1.50 → 1.25
+
+With TP firing at `entry × 1.50`, the trailing stop must activate *before* that level to be functional. Set to `1.25` (+25% above entry), giving the trail a working window between +25% and +50%.
+
+Example at $0.40 entry:
+- Trail activates at $0.50 (+25%)
+- If price peaks at $0.58, trail stop locks at $0.406 (above breakeven)
+- Take-profit fires at $0.60 (+50%)
+- If price reaches $0.55 then reverses, trail stop at $0.385 captures a partial exit rather than a full stop-loss
+
+#### `_notes` in config
+
+All documentation strings updated to reflect the new TP, SL, entry ceiling, and min_edge values.
+
+### What Did Not Change
+
+- All entry gates, re-entry logic, Kelly sizing, calibration
+- `TRAILING_DISTANCE = 0.30` — trail still follows 30% below peak
+- Auto-tuner bounds — `take_profit_roi` tuner ceiling was already 0.50
+- Scan regions, intervals, position limits, all other config parameters
+
+### Current System State After v4.11
+
+- **Take-profit**: +50% ROI (`entry × 1.50`)
+- **Stop-loss**: −37.5% max loss (`entry × 0.625`)
+- **Trailing stop**: activates at +25% (`entry × 1.25`), trails 30% below peak
+- **Entry zone**: $0.10 – $0.65 (ceiling corrected from $0.75)
+- **Min edge**: 7pp (was 5pp)
+- **R:R**: ~1.33:1, breakeven win rate ~43%
+
+---
+
+## v4.10 — `--positions` Command (2026-04-22)
+
+### Why This Change Was Made
+
+`python bot_v4.py status` shows open positions but only as single-line summaries. There was
+no way to inspect the full detail of an individual position — shares held, exact cost basis,
+live current price, distance to stop and take-profit, or whether trailing stop had activated —
+without reading the raw JSON market files.
+
+### What Changed
+
+#### New `print_positions()` function + CLI command
+
+**Invocation (both forms supported):**
+```
+python bot_v4.py --positions        # live
+python bot_v4.py --sim --positions  # sim mode
+python bot_v4.py positions          # positional alias
+```
+
+**Per-position output:**
+
+```
+  ──────────────────────────────────────────────────────────────────
+  New York City      2026-04-25   72-73F   [Cycle 1]  [UP]
+  ──────────────────────────────────────────────────────────────────
+  Shares:        14.29
+  Cost:          $5.00
+  Entry price:   $0.3500
+  Current price: $0.4200
+  Current value: $6.00   (+20.0% ROI)
+  Unrealized:    +$1.00
+  Stop price:    $0.2945  [TRAILING — peak $0.420]
+  Take-profit:   $0.7000  (+100%)
+  P (model):     52%  model delta=1.2F  edge=+0.170
+  Opened:        2026-04-22 14:35 UTC
+```
+
+**Footer:** totals row across all open positions — total cost, current value, net unrealized P&L.
+
+#### Price sourcing
+
+Live price is fetched from the Gamma API (`get_market_price()`) for each position at call time.
+Falls back to the cached `all_outcomes` price stored in the market file, then to `entry_price`
+if neither is available (e.g. network error).
+
+#### Trailing stop display
+
+When `trailing_activated` is true, the stop line includes the current peak price:
+```
+  Stop price:    $0.2945  [TRAILING — peak $0.420]
+```
+When not yet activated, just the static stop price is shown.
+
+### What Did Not Change
+
+- All strategy logic, entry/exit mechanics, simulation mode
+- `status` command output — unchanged (still the compact one-liner format)
+- No new config parameters
+
+### Current System State After v4.10
+
+All v4.9 behavior is unchanged. The `--positions` command is a read-only diagnostic tool.
+
+---
+
+## v4.9 — Sigma Reduction + Bias Decoupling + Tuner Floor Fix (2026-04-20)
+
+### Why This Change Was Made
+
+Simulation mode produced zero buys across all cities and dates. Root-cause analysis
+identified three compounding bugs that made entry mathematically impossible under the
+current default parameters.
+
+**Bug 1 — `min_confidence=0.40` exceeds the theoretical P ceiling (fatal)**
+
+With `SIGMA_F=2.0°F` and the ±0.5° bucket expansion applied in `bucket_prob()`, the
+maximum probability any US 2°F-wide bucket can receive — even when the forecast is
+perfectly centered on it — is:
+
+```
+P_max = Φ(1/2.0) − Φ(−1/2.0) ≈ 0.383
+```
+
+`min_confidence` was set to 0.40 in the config. **0.383 < 0.40** → Gate 3 always
+fails for every US market regardless of market prices or forecasts. The situation is
+worse for EU: with `SIGMA_C=1.2°C` and 1°C-wide buckets, `P_max ≈ 0.324`. Both
+regions were permanently blocked.
+
+Note from the v4.1 changelog: when `min_confidence` was first introduced it was set
+to 0.38 (just below 0.383) specifically because "A US 1°F bucket at sigma=2°F has a
+hard probability ceiling of 0.383." This invariant was violated when the config was
+subsequently raised to 0.40.
+
+The tuner lower bound of `(0.40, 0.70)` compounded this — it could never tune below
+the wall.
+
+**Bug 2 — Bias correction blocked when WU API is down (silent, significant)**
+
+The entire bias-correction block in `scan_and_update()` was wrapped in
+`if WU_API_VALID:`. When the local WU server (`localhost:3000`) is unavailable —
+including during most sim runs where WU isn't actively needed — the bot used raw
+(uncorrected) model forecasts even though `calibration.json` contained valid bias
+data with 89–90 samples per city.
+
+Example for Atlanta at raw forecast=78.5°F vs bias-corrected forecast=79.6°F:
+- Without bias: top bucket is 78-79°F (P≈0.37, price=0.47, edge=−0.10) → blocked
+- With bias: top bucket shifts to 80-81°F (P≈0.43, price=0.24, edge=+0.19) → valid entry
+
+The WU API is only needed to add a running_max observation (D+0 only). The existing
+bias data from calibration should always be applied.
+
+### What Changed
+
+#### `SIGMA_F` 2.0 → 1.5°F, `SIGMA_C` 1.2 → 0.85°C
+
+**Old:** `SIGMA_F = 2.0`, `SIGMA_C = 1.2`
+
+**New:** `SIGMA_F = 1.5`, `SIGMA_C = 0.85`
+
+With sigma=1.5°F, the US bucket P_max rises to:
+```
+P_max = Φ(1/1.5) − Φ(−1/1.5) ≈ 0.496
+```
+This clears `min_confidence=0.40` with meaningful headroom, and is more consistent
+with published ECMWF 24h max-temperature forecast accuracy (~±1.5°F).
+
+With sigma=0.85°C, the EU bucket P_max rises to:
+```
+P_max = Φ(0.5/0.85) − Φ(−0.5/0.85) ≈ 0.445
+```
+Also clears the threshold. Previously 0.324 at sigma=1.2.
+
+Validation (Atlanta, bias-corrected forecast=79.63°F, sigma=1.5):
+
+| Bucket | P | Price | Edge | Result |
+|--------|---|-------|------|--------|
+| 80-81°F | 0.428 | 0.240 | +0.188 | **ENTRY** |
+| 78-79°F | 0.388 | 0.470 | −0.082 | blocked |
+| 82-83°F | 0.101 | 0.065 | +0.036 | below min_edge |
+
+#### Bias correction decoupled from `WU_API_VALID`
+
+**Old:** entire bias correction block gated on `if WU_API_VALID:`
+
+**New:** bias correction from calibration always runs; `WU_API_VALID` only gates
+appending the WU running_max observation to the blend.
+
+```python
+# Before: both bias correction and WU obs blocked when WU is down
+if WU_API_VALID:
+    ecmwf_corrected = ecmwf_raw + get_bias(...)
+    ...
+    wu_max = snap.get("wu_running_max")  # also blocked
+    corrected.append((wu_max, wu_sig))
+
+# After: bias correction always applies
+ecmwf_corrected = ecmwf_raw + get_bias(...)   # always
+...
+if WU_API_VALID:
+    wu_max = snap.get("wu_running_max")        # WU obs only when available
+    corrected.append((wu_max, wu_sig))
+```
+
+#### Tuner lower bound: `min_confidence` `(0.40, 0.70)` → `(0.33, 0.70)`
+
+The lower bound was above the old theoretical ceiling (0.383), preventing the tuner
+from discovering that a lower confidence threshold produces better outcomes. Updated
+to 0.33 — safely below the new P_max for both US (0.496) and EU (0.445).
+
+### Mathematical Summary
+
+| Parameter | Before | After | US P_max | EU P_max | Viable? |
+|-----------|--------|-------|---------|---------|---------|
+| SIGMA_F/C | 2.0 / 1.2 | 1.5 / 0.85 | 0.383 → **0.496** | 0.324 → **0.445** | No → **Yes** |
+| min_confidence | 0.40 | 0.40 (unchanged) | — | — | — |
+| tuner lower bound | 0.40 | 0.33 | — | — | — |
+
+### What Did Not Change
+
+- `min_confidence` in config stays at 0.40 — now achievable with sigma=1.5/0.85
+- All entry gates, re-entry logic, stop-loss, take-profit, trailing stop
+- `find_best_entry()` gate structure (Gates 0–6 unchanged)
+- Kelly sizing, calibration, reconciliation, Polymarket API calls
+- Sigma values for WU observations (`SIGMA_WU_F`, `SIGMA_WU_F_FINAL`, etc.)
+- `SIGMA_METAR_F = 1.5`, `SIGMA_METAR_C = 1.0` (unchanged — METAR is deprecated)
+
+### Current System State After v4.9
+
+- **Entry gates**: model agreement → market consensus → price zone → min edge (0.05) → confidence (0.40)
+- **Forecast sigma**: 1.5°F (US), 0.85°C (EU) — calibrated Bayesian sigma overrides these once resolved markets accumulate
+- **Bias correction**: always applied from calibration.json; WU running_max added on top when WU is up
+- **Tuner**: can now adjust min_confidence down to 0.33 if resolved data supports it
+- **Sim mode**: Atlanta 80-81°F fires with P=0.428, edge=+0.188 at bias-corrected forecast 79.6°F
+
+---
+
+## v4.8 — Simulation Mode (2026-04-20)
+
+### Why This Change Was Made
+
+After the three v4.7 bug fixes, confidence in the strategy logic needs to be rebuilt
+before committing more real capital. Simulation mode runs the full strategy — scanning,
+forecasting, entry/exit evaluation — against live Polymarket prices but with no on-chain
+orders and a virtual balance. This allows validating profitability without financial risk.
+
+### What Changed
+
+**New `--sim` flag** (`SIM_MODE = "--sim" in sys.argv`)
+
+All strategy logic runs identically. The only differences in sim mode:
+
+| Component | Live | Sim |
+|---|---|---|
+| `place_buy_order()` | Polymarket FOK/FAK order | Returns mock `{"status": "matched", "orderID": "sim_..."}` |
+| `place_sell_order()` | Polymarket limit FAK sell | Returns mock `{"status": "matched"}` |
+| `get_real_balance()` | On-chain USDC balance | Reads from `sim_state.json` |
+| `get_token_balance()` | On-chain conditional balance | Always returns 0.0 (bypasses chain) |
+| `get_real_entry_price()` | Polymarket trade history | Always returns None |
+| Reconciliation blocks | Checks for orphaned on-chain shares | Skipped entirely |
+| Balance sync (post-scan) | Syncs from on-chain | Uses tracked in-memory balance |
+| Market files | `weather_bot_data/markets/` | `weather_bot_data/sim_markets/` |
+| State file | `weather_bot_data/state.json` | `weather_bot_data/sim_state.json` |
+
+**Separate data paths** ensure sim runs never pollute live market or state files.
+
+**Starting balance**: configurable via `sim_balance` in `weather_bot_config.json` (default $100.00).
+
+### CLI Commands
+
+```
+python bot_v4.py --sim              # run main loop in sim mode
+python bot_v4.py --sim status       # show sim balance and open positions
+python bot_v4.py --sim report       # show sim resolved markets and PnL
+python bot_v4.py --sim sim-reset    # wipe sim_state.json and sim_markets/
+```
+
+### Current System State After v4.8
+
+- Live bot: v4.7 with three bug fixes applied. 3 trades, -$1.57 net PnL.
+- Sim mode: ready. Run `python bot_v4.py --sim` to begin paper-trading.
+- Calibration: 58-59 samples per city, bias correction active.
+- WU API: running at localhost:3000. `pip install tzdata` recommended for timezone conversion.
+
+---
+
+## v4.7 — Three Bug Fixes: WU Timezone, Re-entry Gate, Corrected Model Delta (2026-04-20)
+
+### Why This Change Was Made
+
+Post-mortem of the first three v4.6 live trades (1 win +$0.05, 2 losses −$1.62, net −$1.57)
+identified three bugs, each independently responsible for a bad entry.
+
+**Bug 1 — WU timezone conversion silently fails on Windows → overnight low corrupts forecast (NYC)**
+
+`get_wu_running_max()` used `local_hour = 12` as the fallback when timezone conversion failed.
+On Windows, `from zoneinfo import ZoneInfo` succeeds (Python 3.9+ stdlib) but
+`ZoneInfo("America/New_York")` raises `ZoneInfoNotFoundError` at runtime because the `tzdata`
+package is not installed. The `except Exception: pass` swallowed this and kept `local_hour = 12`.
+
+At NYC entry time (05:44 UTC = **01:44 am EDT**), the WU running_max was 44°F — the overnight
+minimum. With `local_hour = 12` the code treated it as a "morning" observation (sigma=1.5°F),
+blended it into the forecast with weight 1/σ² = 0.44, and dragged the forecast from the true
+model consensus (~51°F) down to 47.8°F. This caused the bot to enter the 48–49°F bucket instead
+of the 50–51°F bucket — both resolved NO (actual high: 47°F), but the bug caused a wrong-bucket
+entry on a trade that would have otherwise been skipped (P at 51°F forecast would be below
+min_confidence=0.38 for any 1°F bucket).
+
+The `else` pytz branch was also unreachable: it only ran when `ZoneInfo is None` (import failed),
+but since the import succeeded, pytz was never tried even when ZoneInfo's runtime lookup failed.
+
+**Bug 2 — Re-entry path bypassed model agreement gate (Buenos Aires Cycle 2)**
+
+`find_best_entry()` has Gate 0: `if model_delta > MAX_MODEL_DELTA: return None`. This gate was
+only applied to first entries. `evaluate_reentry()` has no such check. Buenos Aires Cycle 2 was
+entered with ECMWF=23.7°C, GFS=21.0°C, **model_delta=2.7°C** — above the 2.0°C gate that would
+have blocked a first entry. Result: −$1.00 stop loss.
+
+**Bug 3 — Model delta gate used raw (pre-bias) temperatures**
+
+`model_delta = snap.get("model_delta")` was computed before bias correction ran. The forecast
+decisions used bias-corrected values; the gate used uncorrected ones. For NYC at entry:
+raw_delta=0°F (both models showed 50°F) → gate passed. Corrected: ECMWF+2.28=52.3°F,
+GFS−0.10=49.9°F → corrected_delta=2.4°F → would have failed the 2.0°F gate. For Buenos Aires
+both cycles: raw_delta≤2.0°C → passed; corrected delta was 3.7°C → both would have been blocked.
+
+### What Changed
+
+#### `get_wu_running_max()` — timezone fallback changed from 12 to -1 + ZoneInfo runtime fallback
+
+**Old:** `local_hour = 12` — treated unknown timezone as "noon", triggering inclusion of WU with
+sigma=1.5°F even at 1:44am local.
+
+**New:** `local_hour = -1` — any conversion failure means "skip WU entirely". -1 < 8, so the
+early-morning guard (`if sig is None`) blocks the observation.
+
+Also restructured the try block so ZoneInfo is attempted first, and if `ZoneInfo(tz_name)` raises
+at runtime (not just on import), the code falls through to pytz rather than silently keeping -1.
+Both pytz and tzdata paths now work correctly.
+
+#### `scan_and_update()` — model_delta recomputed from bias-corrected temperatures
+
+After applying bias correction to ECMWF and GFS, `model_delta` is now updated:
+
+```python
+if ecmwf_corrected is not None and gfs_corrected is not None:
+    model_delta = round(abs(ecmwf_corrected - gfs_corrected), 1)
+```
+
+This is computed before WU is appended to the blend, so it accurately reflects the
+model disagreement used in the forecast decision. The stored `model_delta` in
+`forecast_snapshots` will now show the corrected delta (more diagnostic value).
+
+#### `scan_and_update()` — Gate 0 applied to re-entries
+
+Re-entry candidate construction is now guarded by the same model agreement check as first entry:
+
+```python
+reentry = evaluate_reentry(...) if model_delta is None or model_delta <= MAX_MODEL_DELTA else None
+```
+
+Model disagreement that would block a first entry now also blocks a re-entry on the same market.
+
+### Backtest Against Live Trades
+
+| Trade | Bug | Would be blocked? |
+|-------|-----|------------------|
+| NYC C1 | Bug 1 + Bug 3 | Bug 3: corrected_delta=2.4°F > 2.0°F → blocked |
+| Buenos Aires C1 | Bug 3 | corrected_delta=3.7°C > 2.0°C → blocked |
+| Buenos Aires C2 | Bug 2 + Bug 3 | Both gates would block it |
+
+All three live losses would have been avoided. The only live trade surviving the fixed gates is
+Buenos Aires C1 Cycle 1 (+$0.05) — which would also be blocked by Bug 3's corrected delta.
+Net: 0 trades, $0 PnL vs actual −$1.57.
+
+### Current System State (v4.7)
+
+- **Entry gates**: model agreement (corrected Δ ≤ 2°F/°C) → market consensus → price zone → min edge → confidence
+- **Re-entry**: model agreement gate now applied (was missing in v4.6)
+- **D+0 WU**: timezone failure skips WU entirely (safe fallback); ZoneInfo/pytz both tried correctly
+- **Model delta**: computed from bias-corrected temperatures, consistent with forecast decision values
+- All other behavior unchanged from v4.6
+
+---
+
+## v4.6 — Wunderground Integration + Station Bias Correction (2026-04-19)
+
+### Why This Change Was Made
+
+Post-mortem on two losses (Dallas Apr 17: 83°F actual, we bet 84-85°F; Paris Apr 17: 21°C actual,
+we bet 20°C) confirmed a fundamental data mismatch: Polymarket markets resolve on specific airport
+Wunderground station readings, but the bot was:
+
+1. **Calibrating against Visual Crossing** — VC may return a different temperature than the WU
+   station the market actually resolves on. Sigma built against VC data is calibrating against the
+   wrong source.
+
+2. **Using METAR for D+0** — METAR is an instantaneous reading (current temperature at time of
+   poll). The market resolves on the **daily high**, which is the WU `running_max`. A falling
+   afternoon temperature would suppress METAR below the actual peak, biasing bucket selection down.
+
+3. **No station-level bias correction** — ECMWF/GFS grid forecasts (~25km) have systematic
+   cold/warm biases at specific airport stations. Without tracking `actual_wu − forecast` per city,
+   probability buckets are centered on the wrong temperature.
+
+A WU scraper API was already built and running at `localhost:3000` with data for all 19 configured
+stations. Bootstrap over 2 months of WU history vs Open-Meteo archives revealed real, significant
+biases:
+
+| City | ECMWF bias | GFS bias |
+|------|-----------|---------|
+| New York (KLGA) | +2.28°F | −0.10°F |
+| Chicago (KORD) | +1.72°F | −0.50°F |
+| Atlanta (KATL) | +1.71°F | +0.69°F |
+| Buenos Aires (SAEZ) | +1.75°C | +0.06°C |
+| Seoul (RKSI) | −0.95°C | +2.97°C |
+
+These biases directly explain why buckets were consistently wrong: for NYC, every ECMWF forecast
+was 2.28°F cold — we were centering probability on the wrong bucket without knowing it.
+
+### What Changed
+
+| Area | Before (v4.5) | After (v4.6) |
+|------|--------------|--------------|
+| Resolution source | `get_actual_temp()` → Visual Crossing | `get_wu_actual()` → WU `/daily` endpoint |
+| D+0 observation | `get_metar()` → instantaneous temp | `get_wu_running_max()` → WU `/hourly` running_max |
+| D+0 sigma | fixed 1.5°F | tiered: 0.3 (final), 1.0 (afternoon), 1.5 (morning), skip (<8h local) |
+| Calibration | Bayesian sigma only | sigma + bias (`actual_wu − forecast`) per city/source |
+| Bias correction | none | `forecast_corrected = forecast + get_bias(city, source, horizon)` before every entry decision |
+| Startup | load calibration | load calibration → bootstrap bias from 3 months of WU history |
+| Config | no `wu_api_url` | `wu_api_url: "http://localhost:3000"` |
+
+### New Functions
+
+- **`get_wu_actual(city_slug, date_str)`** — WU daily high for a finalized date. Used by
+  calibration backfill and auto-resolution.
+- **`get_wu_running_max(city_slug, date_str)`** — WU hourly running_max for D+0. Returns
+  `{running_max, is_finalized, local_hour, station_timezone}`. Sigma tier selected by local hour.
+- **`get_bias(city_slug, source, horizon=None)`** — returns calibrated mean bias or 0.0 if fewer
+  than `BIAS_MIN_N=5` samples. Mirrors `get_sigma()`.
+- **`bootstrap_wu_calibration(months=3)`** — fetches WU monthly summaries + Open-Meteo archive
+  hindcasts, computes `mean(wu_high − model)` per city/source, writes to `calibration.json`.
+
+### New Calibration Keys
+
+`calibration.json` now stores bias entries alongside sigma entries:
+```json
+"nyc_ecmwf_bias": {"bias": 2.276, "n": 58, "updated_at": "..."},
+"nyc_hrrr_bias":  {"bias": -0.10, "n": 58, "updated_at": "..."}
+```
+Bias keys: `{city}_{source}_bias` and `{city}_{source}_bias_d{N}` (per-horizon variants updated
+by `run_calibration()` as positions resolve).
+
+### How Bias Correction Works
+
+In `scan_and_update()`, immediately after fetching the forecast snapshot and before calling
+`find_best_entry()`, each model value is corrected and re-blended:
+```python
+ecmwf_corrected = ecmwf_raw + get_bias(city, "ecmwf", horizon=i)
+gfs_corrected   = gfs_raw   + get_bias(city, "hrrr",  horizon=i)
+forecast_temp, sigma = _blend_iv([(ecmwf_corrected, σ_e), (gfs_corrected, σ_g), ...])
+```
+Raw model values are preserved in market files for ongoing calibration.
+
+### Current System State (v4.6)
+
+- **Entry**: model agreement gate (Δ ≤ 2°F/1.5°C) → price zone → min edge → min confidence
+- **D+0**: WU running_max with tiered sigma (0.3→1.0→1.5°F based on local hour)
+- **Bias correction**: applied on every scan for all 19 cities (38 bias entries bootstrapped)
+- **Calibration**: Bayesian sigma + running-mean bias per city/source/horizon
+- **Resolution source**: WU `/daily` endpoint (authoritative, matches market resolution)
+- **Exits**: stop-loss (50%), trailing stop (+50% activation, 30% trail), take-profit (100% ROI)
+- **No forecast-based exits**
+
+---
+
 ## v4.5 — Cycle-Based Convergence Strategy + True Trailing Stop (2026-04-16)
 
 ### Why This Change Was Made

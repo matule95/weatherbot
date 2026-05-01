@@ -43,12 +43,12 @@ def _utc_to_et(dt_utc: datetime) -> datetime:
     offset = timedelta(hours=-4) if edt_start <= dt_utc < edt_end else timedelta(hours=-5)
     return dt_utc + offset
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
     MarketOrderArgs, OrderArgs, OrderType, ApiCreds,
     BalanceAllowanceParams, AssetType,
 )
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client_v2.order_builder.constants import BUY, SELL
 from llm_advisor import build_context, assess_cycle, NEUTRAL_ASSESSMENT
 
 # =============================================================================
@@ -276,7 +276,7 @@ def get_clob_client() -> ClobClient:
                 api_passphrase=POLY_API_PASSPHRASE,
             ))
         else:
-            client.set_api_creds(client.create_or_derive_api_creds())
+            client.set_api_creds(client.create_or_derive_api_key())
         _clob_client = client
     return _clob_client
 

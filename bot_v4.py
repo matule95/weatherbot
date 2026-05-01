@@ -34,9 +34,15 @@ Strategy:
 See CHANGELOG.md for full history.
 
 Usage:
-    python bot_v4.py          # main loop
-    python bot_v4.py status   # balance and open positions
-    python bot_v4.py report   # full report
+    python bot_v4.py              # main loop (live)
+    python bot_v4.py status       # balance and open positions (live)
+    python bot_v4.py report       # full report (live)
+    python bot_v4.py --positions  # detailed per-position breakdown (live)
+    python bot_v4.py --sim        # main loop (simulation — no real orders)
+    python bot_v4.py --sim status # sim balance and open positions
+    python bot_v4.py --sim report # sim full report
+    python bot_v4.py --sim --positions  # detailed positions (sim)
+    python bot_v4.py --sim sim-reset  # wipe sim state and market files
 """
 
 import re
@@ -48,12 +54,20 @@ import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    try:
+        from backports.zoneinfo import ZoneInfo
+    except ImportError:
+        ZoneInfo = None
+
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
     MarketOrderArgs, OrderArgs, OrderType, ApiCreds,
     BalanceAllowanceParams, AssetType,
 )
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client_v2.order_builder.constants import BUY, SELL
 
 # =============================================================================
 # CONFIG
@@ -80,17 +94,32 @@ TUNE_LOOKBACK     = _cfg.get("tune_lookback", 20)
 TUNE_ENABLED      = _cfg.get("tune_enabled", True)
 MAX_OPEN_POS      = _cfg.get("max_open_positions", 10)
 MAX_POS_PER_DATE  = _cfg.get("max_positions_per_date", 5)
+CITY_LOSS_LIMIT   = _cfg.get("city_loss_limit", 2)         # losses in window before pausing city
+CITY_LOSS_WINDOW  = _cfg.get("city_loss_window_hours", 24) # rolling window for the loss count
 MONITOR_INTERVAL  = _cfg.get("monitor_interval", 300)
 STOP_LOSS_PCT     = _cfg.get("stop_loss_pct", 0.75)
 TRAILING_DISTANCE   = 0.30   # trail stop this far below the peak price once trailing activates
-TRAILING_ACTIVATION = 1.50   # trailing activates once price reaches entry × this factor (+50%)
+TRAILING_ACTIVATION = 1.25   # trailing activates once price reaches entry × this factor (+25%)
 SCAN_REGIONS      = set(_cfg.get("scan_regions", ["us", "eu"]))
 MAX_CYCLES        = _cfg.get("max_cycles_per_market", 3)
 MIN_BET           = _cfg.get("min_bet", 0.50)
 
-# v4 new gates
-MAX_MODEL_DELTA   = _cfg.get("max_model_delta", 2.0)   # max |ECMWF - GFS| °F/°C allowed for entry
-MIN_EDGE          = _cfg.get("min_edge", 0.10)          # min (P - market_price) required to enter
+# v4 entry gates (unit-aware: F bucket = 1°F wide, C bucket = 1°C wide).
+# Same number of "buckets-of-disagreement" should apply in both regions; a flat
+# constant in raw degrees is 1.8× more permissive in C than in F, which leaks
+# obviously-wrong entries (e.g. Munich 2026-04-29: crowd gap 0.8°C vs 4.0°C cap).
+MAX_MODEL_DELTA_F   = _cfg.get("max_model_delta_f", 2.0)
+MAX_MODEL_DELTA_C   = _cfg.get("max_model_delta_c", 1.1)
+MAX_CROWD_GAP_BUCKS = _cfg.get("max_crowd_gap_buckets", 1.0)  # in bucket-widths
+MAX_MODEL_DELTA     = MAX_MODEL_DELTA_F  # legacy alias for log lines; per-call value resolved by unit
+MIN_EDGE            = _cfg.get("min_edge", 0.10)
+
+def model_delta_cap(unit):
+    return MAX_MODEL_DELTA_F if unit == "F" else MAX_MODEL_DELTA_C
+
+def crowd_gap_cap(unit):
+    # Bucket width is 1 unit (1°F or 1°C). Cap is expressed in bucket-widths.
+    return MAX_CROWD_GAP_BUCKS
 
 # CLOB credentials
 POLYMARKET_HOST     = "https://clob.polymarket.com"
@@ -102,10 +131,24 @@ POLY_FUNDER         = _cfg.get("polymarket_funder", "")
 POLY_CHAIN_ID       = _cfg.get("chain_id", 137)
 POLY_SIG_TYPE       = _cfg.get("signature_type", 0)
 
-SIGMA_F       = 2.0   # default forecast sigma in Fahrenheit
-SIGMA_C       = 1.2   # default forecast sigma in Celsius
+SIGMA_F       = 1.5   # default forecast sigma in Fahrenheit (ECMWF 24h max-temp accuracy ~±1.5°F)
+SIGMA_C       = 0.85  # default forecast sigma in Celsius
 SIGMA_METAR_C = 1.0   # METAR is a real observation — tighter sigma
 SIGMA_METAR_F = 1.5
+
+WU_API_URL       = _cfg.get("wu_api_url", "http://localhost:3000")
+SIGMA_WU_F_FINAL = 0.3   # WU finalized — the station reading is the resolution oracle
+SIGMA_WU_C_FINAL = 0.2
+SIGMA_WU_F       = 1.0   # Afternoon running_max — some afternoon swing still possible
+SIGMA_WU_C       = 0.6
+SIGMA_WU_F_EARLY = 1.5   # Morning running_max — large afternoon swing still possible
+SIGMA_WU_C_EARLY = 1.0
+BIAS_MIN_N       = 5     # minimum samples before bias correction is applied
+
+try:
+    WU_API_VALID = requests.get(f"{WU_API_URL}/health", timeout=5).ok
+except Exception:
+    WU_API_VALID = False
 
 DATA_DIR         = Path("weather_bot_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -114,6 +157,16 @@ MARKETS_DIR      = DATA_DIR / "markets"
 MARKETS_DIR.mkdir(exist_ok=True)
 CALIBRATION_FILE = DATA_DIR / "calibration.json"
 STRATEGY_FILE    = DATA_DIR / "strategy.json"
+
+# --- Simulation mode ---
+# Run with --sim to paper-trade without touching the chain.
+# Separate data paths so sim runs never pollute live market files.
+SIM_MODE        = "--sim" in sys.argv
+SIM_BALANCE     = float(_cfg.get("sim_balance", 100.0))
+SIM_MARKETS_DIR = DATA_DIR / "sim_markets"
+SIM_STATE_FILE  = DATA_DIR / "sim_state.json"
+if SIM_MODE:
+    SIM_MARKETS_DIR.mkdir(exist_ok=True)
 
 VC_KEY_VALID = bool(VC_KEY) and VC_KEY != "YOUR_KEY_HERE"
 
@@ -137,23 +190,24 @@ def _load_strategy():
 _load_strategy()
 
 LOCATIONS = {
+    # --- Active markets (optimized 4-city selection) ---
     "nyc":          {"lat": 40.7772,  "lon":  -73.8726, "name": "New York City", "station": "KLGA", "unit": "F", "region": "us"},
-    "chicago":      {"lat": 41.9742,  "lon":  -87.9073, "name": "Chicago",       "station": "KORD", "unit": "F", "region": "us"},
     "miami":        {"lat": 25.7959,  "lon":  -80.2870, "name": "Miami",         "station": "KMIA", "unit": "F", "region": "us"},
-    "dallas":       {"lat": 32.8471,  "lon":  -96.8518, "name": "Dallas",        "station": "KDAL", "unit": "F", "region": "us"},
-    "seattle":      {"lat": 47.4502,  "lon": -122.3088, "name": "Seattle",       "station": "KSEA", "unit": "F", "region": "us"},
     "atlanta":      {"lat": 33.6407,  "lon":  -84.4277, "name": "Atlanta",       "station": "KATL", "unit": "F", "region": "us"},
     "london":       {"lat": 51.5048,  "lon":    0.0495, "name": "London",        "station": "EGLC", "unit": "C", "region": "eu"},
-    "paris":        {"lat": 48.9962,  "lon":    2.5979, "name": "Paris",         "station": "LFPG", "unit": "C", "region": "eu"},
-    "munich":       {"lat": 48.3537,  "lon":   11.7750, "name": "Munich",        "station": "EDDM", "unit": "C", "region": "eu"},
-    "ankara":       {"lat": 40.1281,  "lon":   32.9951, "name": "Ankara",        "station": "LTAC", "unit": "C", "region": "eu"},
+    # --- Paused: opposite-direction model biases / historical delta losses ---
+    "chicago":    {"lat": 41.9742,  "lon":  -87.9073, "name": "Chicago",       "station": "KORD", "unit": "F", "region": "us"},
+    "dallas":     {"lat": 32.8471,  "lon":  -96.8518, "name": "Dallas",        "station": "KDAL", "unit": "F", "region": "us"},
+    "seattle":    {"lat": 47.4502,  "lon": -122.3088, "name": "Seattle",       "station": "KSEA", "unit": "F", "region": "us"},
+    "paris":      {"lat": 48.9962,  "lon":    2.5979, "name": "Paris",         "station": "LFPG", "unit": "C", "region": "eu"},
+    "munich":     {"lat": 48.3537,  "lon":   11.7750, "name": "Munich",        "station": "EDDM", "unit": "C", "region": "eu"},
+    "ankara":     {"lat": 40.1281,  "lon":   32.9951, "name": "Ankara",        "station": "LTAC", "unit": "C", "region": "eu"},
     # Kept for future use — not scanned unless added to scan_regions
     "seoul":        {"lat": 37.4691,  "lon":  126.4505, "name": "Seoul",         "station": "RKSI", "unit": "C", "region": "asia"},
     "tokyo":        {"lat": 35.7647,  "lon":  140.3864, "name": "Tokyo",         "station": "RJTT", "unit": "C", "region": "asia"},
     "shanghai":     {"lat": 31.1443,  "lon":  121.8083, "name": "Shanghai",      "station": "ZSPD", "unit": "C", "region": "asia"},
     "singapore":    {"lat":  1.3502,  "lon":  103.9940, "name": "Singapore",     "station": "WSSS", "unit": "C", "region": "asia"},
     "lucknow":      {"lat": 26.7606,  "lon":   80.8893, "name": "Lucknow",       "station": "VILK", "unit": "C", "region": "asia"},
-    "tel-aviv":     {"lat": 32.0114,  "lon":   34.8867, "name": "Tel Aviv",      "station": "LLBG", "unit": "C", "region": "asia"},
     "toronto":      {"lat": 43.6772,  "lon":  -79.6306, "name": "Toronto",       "station": "CYYZ", "unit": "C", "region": "ca"},
     "sao-paulo":    {"lat": -23.4356, "lon":  -46.4731, "name": "Sao Paulo",     "station": "SBGR", "unit": "C", "region": "sa"},
     "buenos-aires": {"lat": -34.8222, "lon":  -58.5358, "name": "Buenos Aires",  "station": "SAEZ", "unit": "C", "region": "sa"},
@@ -168,7 +222,7 @@ TIMEZONES = {
     "munich": "Europe/Berlin", "ankara": "Europe/Istanbul",
     "seoul": "Asia/Seoul", "tokyo": "Asia/Tokyo",
     "shanghai": "Asia/Shanghai", "singapore": "Asia/Singapore",
-    "lucknow": "Asia/Kolkata", "tel-aviv": "Asia/Jerusalem",
+    "lucknow": "Asia/Kolkata",
     "toronto": "America/Toronto", "sao-paulo": "America/Sao_Paulo",
     "buenos-aires": "America/Argentina/Buenos_Aires", "wellington": "Pacific/Auckland",
 }
@@ -201,11 +255,18 @@ def get_clob_client() -> ClobClient:
                 api_passphrase=POLY_API_PASSPHRASE,
             ))
         else:
-            client.set_api_creds(client.create_or_derive_api_creds())
+            client.set_api_creds(client.create_or_derive_api_key())
         _clob_client = client
     return _clob_client
 
 def get_real_balance() -> float | None:
+    if SIM_MODE:
+        if SIM_STATE_FILE.exists():
+            try:
+                return json.loads(SIM_STATE_FILE.read_text(encoding="utf-8")).get("balance", SIM_BALANCE)
+            except Exception:
+                pass
+        return SIM_BALANCE
     try:
         resp = get_clob_client().get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
@@ -217,6 +278,9 @@ def get_real_balance() -> float | None:
 
 def place_buy_order(token_id: str, cost: float) -> dict | None:
     """Place a market BUY order for `cost` USDC. Tries FOK then FAK."""
+    if SIM_MODE:
+        import uuid
+        return {"status": "matched", "orderID": f"sim_{uuid.uuid4().hex[:8]}"}
     client = get_clob_client()
     mo = MarketOrderArgs(token_id=token_id, amount=cost, side=BUY)
     for order_type in (OrderType.FOK, OrderType.FAK):
@@ -235,6 +299,8 @@ def place_sell_order(token_id: str, size: float, price: float, market_id: str = 
     Fetches actual on-chain balance first to prevent over-sell errors.
     Uses best bid for realistic fill pricing.
     """
+    if SIM_MODE:
+        return {"status": "matched"}
     client = get_clob_client()
     actual_size = round(size, 2)
 
@@ -290,7 +356,7 @@ def place_sell_order(token_id: str, size: float, price: float, market_id: str = 
         return None
 
 def get_token_balance(token_id: str) -> float:
-    if not token_id:
+    if SIM_MODE or not token_id:
         return 0.0
     try:
         bal_resp = get_clob_client().get_balance_allowance(
@@ -303,6 +369,8 @@ def get_token_balance(token_id: str) -> float:
 
 def get_real_entry_price(token_id: str) -> float | None:
     """Query Polymarket trade history to find actual average buy price."""
+    if SIM_MODE:
+        return None
     try:
         client = get_clob_client()
         try:
@@ -357,6 +425,60 @@ def bucket_prob(forecast, t_low, t_high, sigma=None):
     # Bounded bucket — expand by ±0.5 for integer rounding
     return norm_cdf((t_high + 0.5 - float(forecast)) / s) - norm_cdf((t_low - 0.5 - float(forecast)) / s)
 
+def city_recently_lost(city_slug, all_markets, now, window_hours=None, limit=None):
+    """Return True if the city has accumulated >= `limit` negative-PnL exits in the
+    past `window_hours`. Used as a per-city circuit breaker to block new entries
+    after a loss cluster (e.g. Munich's 3 consecutive stops on 2026-04-29 cost
+    the sim ~$26 — a single-city block would have stopped at the second one).
+
+    Cycles span all markets for the city, not just one resolution date.
+    """
+    window  = window_hours if window_hours is not None else CITY_LOSS_WINDOW
+    cap     = limit if limit is not None else CITY_LOSS_LIMIT
+    cutoff  = now - timedelta(hours=window)
+    losses  = 0
+    for m in all_markets:
+        if m.get("city") != city_slug:
+            continue
+        for c in m.get("cycles", []):
+            if (c.get("pnl") or 0) >= 0:
+                continue
+            closed_at = c.get("closed_at")
+            if not closed_at:
+                continue
+            try:
+                ts = datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+            if ts >= cutoff:
+                losses += 1
+                if losses >= cap:
+                    return True
+    return False
+
+
+def forecast_diverged(forecast_temp, t_low, t_high, tolerance=0.5):
+    """Return True when the forecast has moved outside the bucket's rounding window.
+
+    Used as the primary loss-side exit signal. Price-based stops do not reliably
+    cap loss in weather markets — prices gap toward zero on resolution rather
+    than declining smoothly. Exiting on a model update is the actual recoverable
+    signal: by the time the corrected forecast clears the rounding window, the
+    bucket is unlikely to win and price will continue to decay.
+
+    Terminal lower bucket (-999, X): diverged if forecast > X + tolerance
+    Terminal upper bucket (X, 999): diverged if forecast < X - tolerance
+    Bounded bucket [X, Y]: diverged if forecast < X - tolerance or > Y + tolerance
+    """
+    if forecast_temp is None or t_low is None or t_high is None:
+        return False
+    if t_low == -999:
+        return forecast_temp > t_high + tolerance
+    if t_high == 999:
+        return forecast_temp < t_low - tolerance
+    return forecast_temp < t_low - tolerance or forecast_temp > t_high + tolerance
+
+
 def calc_ev(p, price):
     """Expected value per dollar risked: p/price - 1 (positive = model has edge over market)."""
     if price <= 0 or price >= 1:
@@ -394,6 +516,20 @@ def get_sigma(city_slug, source="ecmwf", horizon=None):
         return _cal[base_key]["sigma"]
     return SIGMA_F if LOCATIONS[city_slug]["unit"] == "F" else SIGMA_C
 
+def get_bias(city_slug, source, horizon=None):
+    """Calibrated model bias (actual_wu − forecast). Positive = model runs cold.
+    Returns 0.0 until BIAS_MIN_N samples are available."""
+    if horizon is not None:
+        h_key = f"{city_slug}_{source}_bias_d{horizon}"
+        entry = _cal.get(h_key)
+        if entry and entry.get("n", 0) >= BIAS_MIN_N:
+            return entry["bias"]
+    base_key = f"{city_slug}_{source}_bias"
+    entry = _cal.get(base_key)
+    if entry and entry.get("n", 0) >= BIAS_MIN_N:
+        return entry["bias"]
+    return 0.0
+
 def run_calibration(markets):
     resolved = [m for m in markets if m.get("status") == "resolved" and m.get("actual_temp") is not None]
     if not resolved:
@@ -401,6 +537,7 @@ def run_calibration(markets):
 
     cal     = load_cal()
     updated = []
+    now_str = datetime.now(timezone.utc).isoformat()
 
     # Note: "hrrr" source name kept for backward compatibility with existing calibration data.
     # The get_gfs() function populates the "hrrr" key in forecast snapshots.
@@ -411,20 +548,25 @@ def run_calibration(markets):
             group       = [m for m in resolved if m["city"] == city]
             prior_sigma = SIGMA_F if LOCATIONS[city]["unit"] == "F" else SIGMA_C
 
-            horizon_errors: dict[str, list] = {}
-            all_errors: list[float] = []
+            horizon_errors:    dict[str, list] = {}
+            horizon_residuals: dict[str, list] = {}
+            all_errors:    list[float] = []
+            all_residuals: list[float] = []
 
             for m in group:
                 for snap in reversed(m.get("forecast_snapshots", [])):
                     temp_val = snap.get(source)
                     if temp_val is None:
                         continue
-                    err = abs(temp_val - m["actual_temp"])
+                    err      = abs(temp_val - m["actual_temp"])
+                    residual = m["actual_temp"] - temp_val   # positive = model runs cold
                     all_errors.append(err)
+                    all_residuals.append(residual)
                     h = snap.get("horizon", "")
                     h_num = h.replace("D+", "") if h.startswith("D+") else None
                     if h_num is not None:
                         horizon_errors.setdefault(h_num, []).append(err)
+                        horizon_residuals.setdefault(h_num, []).append(residual)
                     break
 
             def bayesian_sigma(errors, prior_s):
@@ -440,18 +582,37 @@ def run_calibration(markets):
                 if new is None:
                     continue
                 old = cal.get(key, {}).get("sigma", prior_sigma)
-                cal[key] = {"sigma": new, "n": len(h_errs), "updated_at": datetime.now(timezone.utc).isoformat()}
+                cal[key] = {"sigma": new, "n": len(h_errs), "updated_at": now_str}
                 if abs(new - old) > 0.05:
                     updated.append(f"{LOCATIONS[city]['name']} {source} D+{h_num}: {old:.2f}->{new:.2f}")
+
+                # Bias update for this horizon
+                h_resids = horizon_residuals.get(h_num, [])
+                if h_resids:
+                    bias_key = f"{city}_{source}_bias_d{h_num}"
+                    new_bias = round(sum(h_resids) / len(h_resids), 3)
+                    old_bias = cal.get(bias_key, {}).get("bias", 0.0)
+                    cal[bias_key] = {"bias": new_bias, "n": len(h_resids), "updated_at": now_str}
+                    if abs(new_bias - old_bias) > 0.1:
+                        updated.append(f"{LOCATIONS[city]['name']} {source} D+{h_num} bias: {old_bias:+.2f}->{new_bias:+.2f}")
 
             if all_errors:
                 key = f"{city}_{source}"
                 new = bayesian_sigma(all_errors, prior_sigma)
                 if new is not None:
                     old = cal.get(key, {}).get("sigma", prior_sigma)
-                    cal[key] = {"sigma": new, "n": len(all_errors), "updated_at": datetime.now(timezone.utc).isoformat()}
+                    cal[key] = {"sigma": new, "n": len(all_errors), "updated_at": now_str}
                     if abs(new - old) > 0.05:
                         updated.append(f"{LOCATIONS[city]['name']} {source}: {old:.2f}->{new:.2f}")
+
+                # Bias update overall
+                if all_residuals:
+                    bias_key = f"{city}_{source}_bias"
+                    new_bias = round(sum(all_residuals) / len(all_residuals), 3)
+                    old_bias = cal.get(bias_key, {}).get("bias", 0.0)
+                    cal[bias_key] = {"bias": new_bias, "n": len(all_residuals), "updated_at": now_str}
+                    if abs(new_bias - old_bias) > 0.1:
+                        updated.append(f"{LOCATIONS[city]['name']} {source} bias: {old_bias:+.2f}->{new_bias:+.2f}")
 
     CALIBRATION_FILE.write_text(json.dumps(cal, indent=2), encoding="utf-8")
     if updated:
@@ -553,7 +714,68 @@ def get_metar(city_slug):
                 print(f"  [METAR] {city_slug}: {e}")
     return None
 
+def get_wu_running_max(city_slug, date_str):
+    """Fetch WU running_max for D+0 via the hourly endpoint.
+
+    Returns dict with running_max (in station's native unit), is_finalized,
+    local_hour (of the running_max observation), and station_timezone.
+    Returns None if WU API is down, no observations yet, or too early to use.
+    """
+    if not WU_API_VALID:
+        return None
+    loc     = LOCATIONS[city_slug]
+    station = loc["station"]
+    unit    = loc["unit"]
+    url     = f"{WU_API_URL}/weather/{station}/hourly?date={date_str}"
+    try:
+        resp = requests.get(url, timeout=(5, 10))
+        if not resp.ok:
+            return None
+        data        = resp.json()
+        running_max = data.get("running_max")
+        if running_max is None:
+            return None
+        running_max = float(running_max)
+
+        # Determine local hour of the running_max observation.
+        # Fallback is -1 (not 12) so that a timezone conversion failure causes WU to be
+        # skipped entirely rather than included at the wrong sigma tier. On Windows,
+        # ZoneInfo(tz_name) raises ZoneInfoNotFoundError without the tzdata package, so we
+        # must also try pytz when ZoneInfo fails at runtime (not just when it fails to import).
+        tz_name  = data.get("station_timezone") or TIMEZONES.get(city_slug, "UTC")
+        rmt      = data.get("running_max_time")
+        local_hour = -1  # skip WU when timezone conversion fails — avoids overnight low corrupting forecast
+        if rmt:
+            try:
+                utc_dt    = datetime.fromisoformat(rmt.replace("Z", "+00:00"))
+                converted = False
+                if ZoneInfo is not None:
+                    try:
+                        local_dt   = utc_dt.astimezone(ZoneInfo(tz_name))
+                        local_hour = local_dt.hour
+                        converted  = True
+                    except Exception:
+                        pass  # ZoneInfo available but tz lookup failed (e.g. tzdata not installed)
+                if not converted:
+                    import pytz
+                    local_dt   = utc_dt.astimezone(pytz.timezone(tz_name))
+                    local_hour = local_dt.hour
+            except Exception:
+                pass  # local_hour stays -1 → WU skipped
+
+        running_max = round(running_max) if unit == "F" else round(running_max, 1)
+        return {
+            "running_max":      running_max,
+            "is_finalized":     bool(data.get("is_finalized")),
+            "local_hour":       local_hour,
+            "station_timezone": tz_name,
+        }
+    except Exception as e:
+        print(f"  [WU-MAX] {city_slug} {date_str}: {e}")
+        return None
+
 def get_actual_temp(city_slug, date_str):
+    """Deprecated: use get_wu_actual() instead. Kept for fallback."""
     loc     = LOCATIONS[city_slug]
     station = loc["station"]
     unit    = loc["unit"]
@@ -570,6 +792,47 @@ def get_actual_temp(city_slug, date_str):
             return round(float(days[0]["tempmax"]), 1)
     except Exception as e:
         print(f"  [VC] {city_slug} {date_str}: {e}")
+    return None
+
+def get_wu_actual(city_slug, date_str):
+    """Fetch the WU daily high for a finalized date. Used for calibration/resolution.
+
+    This is the authoritative source — Polymarket markets resolve on WU station
+    readings, so calibration must use WU data (not Visual Crossing) to be meaningful.
+    Returns None if WU is unavailable, day is not yet finalized, or no data.
+    """
+    if not WU_API_VALID:
+        return None
+    loc           = LOCATIONS[city_slug]
+    station       = loc["station"]
+    expected_unit = loc["unit"]
+    url           = f"{WU_API_URL}/weather/{station}/daily?date={date_str}"
+    for attempt in range(2):
+        try:
+            resp = requests.get(url, timeout=(5, 10))
+            if not resp.ok:
+                return None
+            data = resp.json()
+            if not data.get("is_finalized"):
+                return None
+            high = data.get("high")
+            if high is None:
+                return None
+            high    = float(high)
+            wu_unit = data.get("unit", expected_unit)
+            if wu_unit != expected_unit:
+                if expected_unit == "F":
+                    high = round(high * 9 / 5 + 32)
+                else:
+                    high = round((high - 32) * 5 / 9, 1)
+            else:
+                high = round(high) if expected_unit == "F" else round(high, 1)
+            return high
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(1)
+            else:
+                print(f"  [WU-ACTUAL] {city_slug} {date_str}: {e}")
     return None
 
 def _blend_iv(temps_and_sigmas):
@@ -593,13 +856,19 @@ def _blend_iv(temps_and_sigmas):
     blended_sigma = math.sqrt(sum(s ** 2 for _, s in temps_and_sigmas) / len(temps_and_sigmas))
     return round(blended_temp, 1), round(blended_sigma, 3)
 
-def take_forecast_snapshot(city_slug, dates, horizon_map=None, metar_max=None):
+def take_forecast_snapshot(city_slug, dates, horizon_map=None):
     """
     Fetches ECMWF and GFS forecasts, blends them, and returns per-date snapshots.
 
-    Each snapshot includes `model_delta` — the absolute difference between ECMWF
-    and GFS (in native units). This is used as the model agreement gate in
-    find_best_entry(): if model_delta > MAX_MODEL_DELTA, skip the market entirely.
+    For D+0, replaces the old METAR (instantaneous) with the WU running_max
+    (the highest reading recorded so far today). The running_max is what the
+    Polymarket market will resolve on, making it the correct D+0 signal.
+
+    WU sigma is tiered by time of day:
+      - Finalized (day over): 0.3F/0.2C — station reading is the resolution value
+      - Afternoon (local hour >= 14): 1.0F/0.6C — most of the day observed
+      - Morning (local hour >= 8): 1.5F/1.0C — significant afternoon swing still possible
+      - Early (<8h local): WU observation skipped (too early, high uncertainty)
 
     Snapshots store GFS data under the key "hrrr" for backward compatibility
     with run_calibration() and existing market files.
@@ -608,16 +877,38 @@ def take_forecast_snapshot(city_slug, dates, horizon_map=None, metar_max=None):
     ecmwf   = get_ecmwf(city_slug, dates)
     gfs     = get_gfs(city_slug, dates)     # stored as "hrrr" in snapshots
     today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    loc     = LOCATIONS[city_slug]
 
     snapshots = {}
     for date in dates:
-        h             = horizon_map.get(date) if horizon_map else None
-        current_metar = get_metar(city_slug) if date == today else None
+        h = horizon_map.get(date) if horizon_map else None
+
+        # WU running_max for D+0 (replaces METAR)
+        wu_obs   = None
+        wu_sigma = None
+        if date == today and WU_API_VALID:
+            obs = get_wu_running_max(city_slug, date)
+            if obs and obs["running_max"] is not None:
+                is_us = loc["unit"] == "F"
+                if obs["is_finalized"]:
+                    sig = SIGMA_WU_F_FINAL if is_us else SIGMA_WU_C_FINAL
+                elif obs["local_hour"] >= 14:
+                    sig = SIGMA_WU_F if is_us else SIGMA_WU_C
+                elif obs["local_hour"] >= 8:
+                    sig = SIGMA_WU_F_EARLY if is_us else SIGMA_WU_C_EARLY
+                else:
+                    sig = None   # too early; skip
+                if sig is not None:
+                    wu_obs   = obs
+                    wu_sigma = sig
+
         snap = {
-            "ts":    now_str,
-            "ecmwf": ecmwf.get(date),
-            "hrrr":  gfs.get(date),         # stored as "hrrr" for backward compat
-            "metar": current_metar,
+            "ts":             now_str,
+            "ecmwf":          ecmwf.get(date),
+            "hrrr":           gfs.get(date),    # stored as "hrrr" for backward compat
+            "metar":          None,              # deprecated — kept for schema compat
+            "wu_running_max": wu_obs["running_max"] if wu_obs else None,
+            "wu_sigma":       wu_sigma,
         }
 
         # model_delta: how far apart are ECMWF and GFS?
@@ -626,15 +917,6 @@ def take_forecast_snapshot(city_slug, dates, horizon_map=None, metar_max=None):
             snap["model_delta"] = round(abs(snap["ecmwf"] - snap["hrrr"]), 1)
         else:
             snap["model_delta"] = None
-
-        # Running daily-max METAR — don't let a cooling afternoon erase the peak
-        metar_val = current_metar
-        if metar_max and date in metar_max:
-            metar_val = max(metar_val, metar_max[date]) if metar_val is not None else metar_max[date]
-        snap["metar_max"] = metar_val
-
-        loc         = LOCATIONS[city_slug]
-        sigma_metar = SIGMA_METAR_C if loc["unit"] == "C" else SIGMA_METAR_F
 
         sources_for_blend = []
         source_names      = []
@@ -646,20 +928,20 @@ def take_forecast_snapshot(city_slug, dates, horizon_map=None, metar_max=None):
             s = get_sigma(city_slug, "hrrr", horizon=h)
             sources_for_blend.append((snap["hrrr"], s))
             source_names.append("gfs")
-        if metar_val is not None:
-            sources_for_blend.append((metar_val, sigma_metar))
-            source_names.append("metar")
+        if wu_obs is not None:
+            sources_for_blend.append((wu_obs["running_max"], wu_sigma))
+            source_names.append("wu_running_max")
 
         if sources_for_blend:
             bt, bs = _blend_iv(sources_for_blend)
-            snap["best"]        = bt
-            snap["best_sigma"]  = bs
-            snap["best_source"] = "blend" if len(source_names) > 1 else source_names[0]
+            snap["best"]         = bt
+            snap["best_sigma"]   = bs
+            snap["best_source"]  = "blend" if len(source_names) > 1 else source_names[0]
             snap["sources_used"] = source_names
         else:
-            snap["best"]        = None
-            snap["best_sigma"]  = None
-            snap["best_source"] = None
+            snap["best"]         = None
+            snap["best_sigma"]   = None
+            snap["best_source"]  = None
             snap["sources_used"] = []
 
         snapshots[date] = snap
@@ -749,7 +1031,8 @@ def in_bucket(forecast, t_low, t_high):
 # =============================================================================
 
 def market_path(city_slug, date_str):
-    return MARKETS_DIR / f"{city_slug}_{date_str}.json"
+    d = SIM_MARKETS_DIR if SIM_MODE else MARKETS_DIR
+    return d / f"{city_slug}_{date_str}.json"
 
 def load_market(city_slug, date_str):
     p = market_path(city_slug, date_str)
@@ -762,8 +1045,9 @@ def save_market(market):
     p.write_text(json.dumps(market, indent=2, ensure_ascii=False), encoding="utf-8")
 
 def load_all_markets():
+    d = SIM_MARKETS_DIR if SIM_MODE else MARKETS_DIR
     markets = []
-    for f in MARKETS_DIR.glob("*.json"):
+    for f in d.glob("*.json"):
         try:
             markets.append(json.loads(f.read_text(encoding="utf-8")))
         except Exception:
@@ -803,8 +1087,22 @@ def get_active_cycle(market_data):
 # =============================================================================
 
 def load_state():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    sf = SIM_STATE_FILE if SIM_MODE else STATE_FILE
+    if sf.exists():
+        return json.loads(sf.read_text(encoding="utf-8"))
+    if SIM_MODE:
+        print(f"  [SIM] Starting sim with ${SIM_BALANCE:.2f} virtual balance")
+        return {
+            "balance":          SIM_BALANCE,
+            "starting_balance": SIM_BALANCE,
+            "net_pnl":          0.0,
+            "total_trades":     0,
+            "profitable_exits": 0,
+            "losing_exits":     0,
+            "resolved_wins":    0,
+            "resolved_losses":  0,
+            "peak_balance":     SIM_BALANCE,
+        }
     # Fresh start: use actual on-chain balance, fall back to config value
     real_bal = get_real_balance()
     starting = round(real_bal, 2) if real_bal is not None else BALANCE
@@ -825,7 +1123,8 @@ def load_state():
     }
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    sf = SIM_STATE_FILE if SIM_MODE else STATE_FILE
+    sf.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 # =============================================================================
 # ENTRY EVALUATION
@@ -889,11 +1188,11 @@ def find_best_entry(outcomes, forecast_temp, sigma, balance, market_record,
     bucket against all strategy gates. Returns an entry dict or None.
 
     Strategy gates (failures skip the market entirely — no fallback):
-      0. Model agreement: |ECMWF - GFS| <= MAX_MODEL_DELTA — block entire market
-         if models disagree. Data shows disagreement predicts wrong-bucket entries.
-      0b. Market-vs-model gap: if the market-implied temperature differs from the
-          model forecast by > 2 × MAX_MODEL_DELTA, the crowd is pricing a different
-          scenario. Block entry — the model is likely wrong.
+      0. Model agreement: |ECMWF - GFS| <= unit-aware cap — block market when
+         models disagree. Cap is 2.0°F or 1.1°C (≈ same number of buckets).
+      0b. Market-vs-model gap: if the crowd's implied temperature differs from
+          our forecast by > MAX_CROWD_GAP_BUCKS bucket-widths, block entry. The
+          crowd is pricing a different scenario — the model is likely wrong.
       1. Price in opportunity zone: MIN_ENTRY_PRICE..MAX_ENTRY_PRICE
       2. Minimum edge: P - market_price >= MIN_EDGE (not just any positive EV)
       3. Confidence: P >= min_confidence
@@ -906,20 +1205,22 @@ def find_best_entry(outcomes, forecast_temp, sigma, balance, market_record,
     if not outcomes or forecast_temp is None:
         return None
 
+    unit = market_record.get("unit") or LOCATIONS.get(market_record.get("city"), {}).get("unit", "F")
+
     # Gate 0: model agreement — block entire market before inspecting any bucket.
-    # Applied here (before the loop) because disagreement makes the entire
-    # market untrustworthy, not just one bucket.
-    if model_delta is not None and model_delta > MAX_MODEL_DELTA:
+    # Cap differs by unit because 1°F and 1°C are the same number of buckets but
+    # very different magnitudes; a flat constant lets too much through in C.
+    if model_delta is not None and model_delta > model_delta_cap(unit):
         return None
 
-    # Gate 0b: market-vs-model gap — if the crowd's implied temperature is more
-    # than 2 × MAX_MODEL_DELTA away from our forecast, the market knows something
-    # the models don't (e.g., local warming, recent observations). Block entry.
+    # Gate 0b: market-vs-model gap — expressed in bucket-widths, so 1.0 means
+    # "the crowd is pricing one whole bucket away from us."  Munich 2026-04-29:
+    # market_temp ≈ 17.4, forecast 16.6 → gap 0.8 < 1.0 (just under the bar).
+    # If you tighten this to 0.7, that case would have been blocked.
     market_temp = market_implied_temp(outcomes)
     if market_temp is not None:
         crowd_gap = abs(market_temp - forecast_temp)
-        max_crowd_gap = 2.0 * MAX_MODEL_DELTA
-        if crowd_gap > max_crowd_gap:
+        if crowd_gap > crowd_gap_cap(unit):
             return None
 
     min_conf = _strategy["min_confidence"]
@@ -1084,24 +1385,10 @@ def scan_and_update():
         print(f"  -> {loc['name']}...", end=" ", flush=True)
 
         try:
-            dates        = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4)]
-            horizon_map  = {d: i for i, d in enumerate(dates)}
-            today_str    = now.strftime("%Y-%m-%d")
+            dates       = [(now + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4)]
+            horizon_map = {d: i for i, d in enumerate(dates)}
 
-            # Preserve running daily-max METAR so a cooling afternoon doesn't erase peak
-            metar_max_today = {}
-            existing_today  = load_market(city_slug, today_str)
-            if existing_today:
-                past_metar = [
-                    s["metar"] for s in existing_today.get("forecast_snapshots", [])
-                    if s.get("metar") is not None
-                ]
-                if past_metar:
-                    metar_max_today[today_str] = max(past_metar)
-
-            snapshots = take_forecast_snapshot(
-                city_slug, dates, horizon_map=horizon_map, metar_max=metar_max_today
-            )
+            snapshots = take_forecast_snapshot(city_slug, dates, horizon_map=horizon_map)
             time.sleep(0.3)
         except Exception as e:
             print(f"skipped ({e})")
@@ -1167,17 +1454,49 @@ def scan_and_update():
             sigma         = snap.get("best_sigma") or get_sigma(city_slug, best_source or "ecmwf", horizon=i)
             model_delta   = snap.get("model_delta")
 
+            # Bias-correct individual model forecasts and re-blend for decision-making.
+            # Raw model values stored in snap are preserved in the market file for calibration.
+            # Bias corrections always apply when calibration data exists (independent of WU).
+            # WU running_max is added only when the WU API is available.
+            ecmwf_raw       = snap.get("ecmwf")
+            gfs_raw         = snap.get("hrrr")
+            corrected       = []
+            ecmwf_corrected = None
+            gfs_corrected   = None
+            if ecmwf_raw is not None:
+                bias_e          = get_bias(city_slug, "ecmwf", horizon=i)
+                ecmwf_corrected = round(ecmwf_raw + bias_e, 1)
+                corrected.append((ecmwf_corrected, get_sigma(city_slug, "ecmwf", horizon=i)))
+            if gfs_raw is not None:
+                bias_g        = get_bias(city_slug, "hrrr", horizon=i)
+                gfs_corrected = round(gfs_raw + bias_g, 1)
+                corrected.append((gfs_corrected, get_sigma(city_slug, "hrrr", horizon=i)))
+            # Recompute model_delta from corrected temps before WU is added.
+            # The gate must use the same temperatures that drive the forecast decision.
+            if ecmwf_corrected is not None and gfs_corrected is not None:
+                model_delta = round(abs(ecmwf_corrected - gfs_corrected), 1)
+            if WU_API_VALID:
+                wu_max = snap.get("wu_running_max")
+                wu_sig = snap.get("wu_sigma")
+                if wu_max is not None and wu_sig is not None:
+                    corrected.append((wu_max, wu_sig))
+            if corrected:
+                bt, bs = _blend_iv(corrected)
+                if bt is not None:
+                    forecast_temp = bt
+                    sigma         = bs or sigma
+
             mkt["forecast_snapshots"].append({
-                "ts":          snap.get("ts"),
-                "horizon":     horizon,
-                "hours_left":  round(hours, 1),
-                "ecmwf":       snap.get("ecmwf"),
-                "hrrr":        snap.get("hrrr"),
-                "model_delta": model_delta,
-                "metar":       snap.get("metar"),
-                "metar_max":   snap.get("metar_max"),
-                "best":        snap.get("best"),
-                "best_source": snap.get("best_source"),
+                "ts":             snap.get("ts"),
+                "horizon":        horizon,
+                "hours_left":     round(hours, 1),
+                "ecmwf":          snap.get("ecmwf"),
+                "hrrr":           snap.get("hrrr"),
+                "model_delta":    model_delta,
+                "metar":          None,
+                "wu_running_max": snap.get("wu_running_max"),
+                "best":           snap.get("best"),
+                "best_source":    snap.get("best_source"),
             })
 
             # Market snapshot: store per-token prices for trend detection
@@ -1190,7 +1509,7 @@ def scan_and_update():
 
             # ---- RECONCILE: detect orphaned on-chain positions ----
             pos = get_active_cycle(mkt)
-            if pos is None and mkt["status"] != "resolved":
+            if not SIM_MODE and pos is None and mkt["status"] != "resolved":
                 cycles = mkt.get("cycles", [])
                 can_reconcile = (
                     len(cycles) < MAX_CYCLES and
@@ -1256,8 +1575,10 @@ def scan_and_update():
                             break
                         time.sleep(0.05)
 
-            # ---- STOP-LOSS / TAKE-PROFIT ----
-            # Exits are price-only. No forecast-based exits.
+            # ---- EXIT CHECKS ----
+            # Take-profit and trailing-stop are price-based; loss-side exit is
+            # forecast-based (forecast_diverged) because price-based stops
+            # don't cap loss in weather markets — prices gap to zero on resolution.
             pos = get_active_cycle(mkt)
             if pos is not None:
                 current_price = next(
@@ -1269,7 +1590,7 @@ def scan_and_update():
                     stop          = pos.get("stop_price", entry * STOP_LOSS_PCT)
                     roi_threshold = entry * (1.0 + _strategy["take_profit_roi"])
 
-                    # True trailing stop: once up 20%, trail TRAILING_DISTANCE below the peak.
+                    # True trailing stop: once up 25%, trail TRAILING_DISTANCE below the peak.
                     # Never locks to breakeven — stop follows the peak price downward at a distance,
                     # so a small price wobble back to entry does not eject the position.
                     if current_price >= entry * TRAILING_ACTIVATION or pos.get("trailing_activated"):
@@ -1281,11 +1602,14 @@ def scan_and_update():
                             pos["stop_price"] = new_stop
                             stop              = new_stop
 
-                    take_triggered = current_price >= roi_threshold and current_price > entry
-                    stop_triggered = current_price <= stop
+                    take_triggered     = current_price >= roi_threshold and current_price > entry
+                    trailing_triggered = pos.get("trailing_activated") and current_price <= stop
+                    diverged_triggered = forecast_diverged(forecast_temp,
+                                                           pos.get("bucket_low"),
+                                                           pos.get("bucket_high"))
 
-                    if take_triggered or stop_triggered:
-                        onchain = get_token_balance(pos["token_id"])
+                    if take_triggered or trailing_triggered or diverged_triggered:
+                        onchain = pos["shares"] if SIM_MODE else get_token_balance(pos["token_id"])
                         if onchain < 1.0:
                             # Already sold externally
                             reason = "sold_externally"
@@ -1308,12 +1632,12 @@ def scan_and_update():
                                 if take_triggered:
                                     reason = "take_profit_roi"
                                     label  = "TAKE ROI"
-                                elif current_price < entry:
-                                    reason = "stop_loss"
-                                    label  = "STOP"
+                                elif diverged_triggered:
+                                    reason = "forecast_diverged"
+                                    label  = "FORECAST EXIT"
                                 else:
                                     reason = "trailing_stop"
-                                    label  = "TRAILING BE"
+                                    label  = "TRAILING"
                                 pnl      = round((current_price - entry) * pos["shares"], 2)
                                 balance += pos["cost"] + pnl
                                 pos["exit_price"]   = current_price
@@ -1346,6 +1670,14 @@ def scan_and_update():
                     time.sleep(0.1)
                     continue
 
+                # City-level circuit breaker: if this city just took multiple
+                # losses in the rolling window, pause new entries on it. Blocks
+                # loss clusters when one city's model is acutely off-calibration.
+                if city_recently_lost(city_slug, all_mkts_cache, now):
+                    save_market(mkt)
+                    time.sleep(0.1)
+                    continue
+
                 candidate = None
 
                 if not cycles_all:
@@ -1355,8 +1687,10 @@ def scan_and_update():
                         model_delta=model_delta
                     )
                 else:
-                    # Re-entry: evaluate risk gates on the same bucket
-                    reentry = evaluate_reentry(cycles_all, outcomes, forecast_temp, sigma, hours)
+                    # Re-entry: evaluate risk gates on the same bucket.
+                    # Gate 0 also applies: model disagreement predicts wrong-bucket re-entry.
+                    reentry = evaluate_reentry(cycles_all, outcomes, forecast_temp, sigma, hours) \
+                              if model_delta is None or model_delta <= model_delta_cap(loc["unit"]) else None
                     if reentry is not None and reentry["volume"] >= MIN_VOLUME:
                         price    = reentry["price"]
                         p        = reentry["p"]
@@ -1417,7 +1751,7 @@ def scan_and_update():
                                     cycle_num    = len(mkt["cycles"]) + 1
                                     bucket_label = f"{candidate['bucket_low']}-{candidate['bucket_high']}{unit_sym}"
                                     entry_type   = "RE-ENTRY" if cycles_all else "BUY"
-                                    delta_str    = f" Δ={model_delta:.1f}{unit_sym}" if model_delta is not None else ""
+                                    delta_str    = f" d={model_delta:.1f}{unit_sym}" if model_delta is not None else ""
                                     mkt["cycles"].append({
                                         "cycle_num":          cycle_num,
                                         "market_id":          candidate["market_id"],
@@ -1508,8 +1842,8 @@ def scan_and_update():
         mkt["status"]       = "resolved"
         mkt["resolved_outcome"] = "win" if won else "loss"
 
-        if VC_KEY_VALID:
-            actual = get_actual_temp(mkt["city"], mkt["date"])
+        if WU_API_VALID:
+            actual = get_wu_actual(mkt["city"], mkt["date"])
             if actual is not None:
                 mkt["actual_temp"] = actual
 
@@ -1530,7 +1864,7 @@ def scan_and_update():
         time.sleep(0.3)
 
     # ---- BACKFILL actual_temp for calibration ----
-    if VC_KEY_VALID:
+    if WU_API_VALID:
         for mkt in load_all_markets():
             if mkt.get("actual_temp") is not None:
                 continue
@@ -1539,15 +1873,18 @@ def scan_and_update():
             except Exception:
                 continue
             if market_date < now.date() and mkt["city"] in LOCATIONS:
-                actual = get_actual_temp(mkt["city"], mkt["date"])
+                actual = get_wu_actual(mkt["city"], mkt["date"])
                 if actual is not None:
                     mkt["actual_temp"] = actual
                     save_market(mkt)
                 time.sleep(0.2)
 
-    # Sync balance from on-chain
-    real_bal = get_real_balance()
-    state["balance"]      = round(real_bal if real_bal is not None else balance, 2)
+    # Sync balance — use tracked sim balance in sim mode, on-chain otherwise
+    if SIM_MODE:
+        state["balance"] = round(balance, 2)
+    else:
+        real_bal = get_real_balance()
+        state["balance"] = round(real_bal if real_bal is not None else balance, 2)
     state["peak_balance"] = max(state.get("peak_balance", balance), state["balance"])
     save_state(state)
 
@@ -1570,8 +1907,8 @@ def monitor_positions():
     markets  = load_all_markets()
     open_pos = [m for m in markets if get_active_cycle(m) is not None]
 
-    # Reconcile: check markets with closed cycles but no active position
-    for mkt in markets:
+    # Reconcile: check markets with closed cycles but no active position (live only)
+    for mkt in ([] if SIM_MODE else markets):
         cycles = mkt.get("cycles", [])
         if not cycles or get_active_cycle(mkt) is not None or mkt["status"] == "resolved":
             continue
@@ -1686,7 +2023,7 @@ def monitor_positions():
         city_name     = LOCATIONS.get(mkt["city"], {}).get("name", mkt["city"])
         ts_now        = datetime.now(timezone.utc).isoformat()
 
-        # True trailing stop: once up 20%, trail TRAILING_DISTANCE below the peak.
+        # True trailing stop: once up 25%, trail TRAILING_DISTANCE below the peak.
         # Never locks to breakeven — stop follows the peak price downward at a distance,
         # so a small price wobble back to entry does not eject the position.
         if current_price >= entry * TRAILING_ACTIVATION or pos.get("trailing_activated"):
@@ -1700,11 +2037,14 @@ def monitor_positions():
                 mutated = True
                 print(f"  [TRAILING] {city_name} {mkt['date']} — stop raised to ${new_stop:.3f} (peak ${peak:.3f})")
 
-        take_triggered = current_price >= roi_threshold and current_price > entry
-        stop_triggered = current_price <= stop
+        # Monitor loop has no fresh forecast — only price-based exits run here.
+        # Trailing stop fires only AFTER trailing has activated (i.e., we were profitable).
+        # Forecast-divergence exit runs in the scan loop where the forecast is fresh.
+        take_triggered     = current_price >= roi_threshold and current_price > entry
+        trailing_triggered = pos.get("trailing_activated") and current_price <= stop
 
-        if take_triggered or stop_triggered:
-            onchain = get_token_balance(pos["token_id"])
+        if take_triggered or trailing_triggered:
+            onchain = pos["shares"] if SIM_MODE else get_token_balance(pos["token_id"])
             if onchain < 1.0:
                 pnl = round((current_price - entry) * pos["shares"], 2)
                 pos["exit_price"]   = current_price
@@ -1728,12 +2068,9 @@ def monitor_positions():
                     if take_triggered:
                         reason = "take_profit_roi"
                         label  = "TAKE ROI"
-                    elif current_price < entry:
-                        reason = "stop_loss"
-                        label  = "STOP"
                     else:
                         reason = "trailing_stop"
-                        label  = "TRAILING BE"
+                        label  = "TRAILING"
                     pos["exit_price"]   = current_price
                     pos["pnl"]          = pnl
                     pos["status"]       = "closed"
@@ -1756,8 +2093,11 @@ def monitor_positions():
             save_market(mkt)
 
     if closed:
-        real_bal = get_real_balance()
-        state["balance"]      = round(real_bal if real_bal is not None else balance, 2)
+        if SIM_MODE:
+            state["balance"] = round(balance, 2)
+        else:
+            real_bal = get_real_balance()
+            state["balance"] = round(real_bal if real_bal is not None else balance, 2)
         state["peak_balance"] = max(state.get("peak_balance", balance), state["balance"])
         save_state(state)
 
@@ -1769,7 +2109,7 @@ def monitor_positions():
 
 _TUNE_BOUNDS = {
     "kelly_fraction":  (0.10, 0.60),
-    "min_confidence":  (0.40, 0.70),
+    "min_confidence":  (0.33, 0.70),
     "take_profit_roi": (0.20, 0.50),
 }
 _TUNE_MAX_STEP = 0.10
@@ -1780,9 +2120,12 @@ def tune_strategy(markets):
     Requires at least 20 closed cycles to activate.
 
     Tunes:
-      kelly_fraction  — win rate vs predicted probability (resolved cycles only)
-      min_confidence  — which confidence band has the best avg PnL
-      take_profit_roi — overall profitable exit rate and stop-loss frequency
+      kelly_fraction  — actual win rate vs predicted probability (any closed cycle
+                        with realised PnL; not restricted to resolved-to-outcome).
+      min_confidence  — which confidence band has the best avg PnL.
+      take_profit_roi — only ratchets UP when results are strong. The down-branch
+                        was removed: high stop rate is caused by bad entries, not
+                        by TP being too high, and lowering TP just shrinks wins.
     """
     all_closed = [
         (m, c) for m in markets
@@ -1796,19 +2139,17 @@ def tune_strategy(markets):
 
     old = dict(_strategy)
 
-    # --- kelly_fraction (signal: model accuracy on resolved markets) ---
-    resolved_only = [(m, c) for m, c in recent_pairs if c.get("close_reason") == "resolved"]
-    if resolved_only:
-        kelly_wins      = sum(1 for _, c in resolved_only if (c.get("pnl") or 0) > 0)
-        actual_wr       = kelly_wins / len(resolved_only)
-        avg_predicted_p = sum(c.get("p") or 0.5 for _, c in resolved_only) / len(resolved_only)
+    # --- kelly_fraction (signal: model accuracy across all closed cycles) ---
+    kelly_wins      = sum(1 for _, c in recent_pairs if (c.get("pnl") or 0) > 0)
+    actual_wr       = kelly_wins / len(recent_pairs)
+    avg_predicted_p = sum(c.get("p") or 0.5 for _, c in recent_pairs) / len(recent_pairs)
 
-        if actual_wr > avg_predicted_p + 0.05:
-            adj = min(0.02, _TUNE_MAX_STEP * _strategy["kelly_fraction"])
-            _strategy["kelly_fraction"] = min(_strategy["kelly_fraction"] + adj, _TUNE_BOUNDS["kelly_fraction"][1])
-        elif actual_wr < avg_predicted_p - 0.05:
-            adj = min(0.02, _TUNE_MAX_STEP * _strategy["kelly_fraction"])
-            _strategy["kelly_fraction"] = max(_strategy["kelly_fraction"] - adj, _TUNE_BOUNDS["kelly_fraction"][0])
+    if actual_wr > avg_predicted_p + 0.05:
+        adj = min(0.02, _TUNE_MAX_STEP * _strategy["kelly_fraction"])
+        _strategy["kelly_fraction"] = min(_strategy["kelly_fraction"] + adj, _TUNE_BOUNDS["kelly_fraction"][1])
+    elif actual_wr < avg_predicted_p - 0.05:
+        adj = min(0.02, _TUNE_MAX_STEP * _strategy["kelly_fraction"])
+        _strategy["kelly_fraction"] = max(_strategy["kelly_fraction"] - adj, _TUNE_BOUNDS["kelly_fraction"][0])
 
     # --- min_confidence (signal: which exclusive confidence band has best avg PnL) ---
     conf_band_ranges = [(0.35, 0.40), (0.40, 0.45), (0.45, 0.50), (0.50, 0.55), (0.55, 0.60), (0.60, 1.01)]
@@ -1839,10 +2180,15 @@ def tune_strategy(markets):
         max(_TUNE_BOUNDS["min_confidence"][0], min(_TUNE_BOUNDS["min_confidence"][1], current + capped)), 4
     )
 
-    # --- take_profit_roi (signal: profitable exit rate and stop frequency) ---
-    total_recent   = len(recent_pairs)
-    profitable_n   = sum(1 for _, c in recent_pairs if (c.get("pnl") or 0) > 0)
-    stop_n         = sum(1 for _, c in recent_pairs if c.get("close_reason") in ("stop_loss", "trailing_stop"))
+    # --- take_profit_roi (one-way ratchet: only raise when results are strong) ---
+    # The previous down-branch lowered TP whenever stop_rate was high, but that
+    # response is incorrect for this market: high stop rate is an entry-quality
+    # problem, not a TP-too-high problem. Lowering TP just shrinks wins while
+    # losses keep their full size and breaks the R:R math.
+    total_recent = len(recent_pairs)
+    profitable_n = sum(1 for _, c in recent_pairs if (c.get("pnl") or 0) > 0)
+    stop_n       = sum(1 for _, c in recent_pairs
+                       if c.get("close_reason") in ("stop_loss", "trailing_stop", "forecast_diverged"))
 
     if total_recent > 0:
         profit_rate = profitable_n / total_recent
@@ -1851,9 +2197,6 @@ def tune_strategy(markets):
         if profit_rate > 0.60 and stop_rate < 0.20:
             adj = min(0.01, _TUNE_MAX_STEP * _strategy["take_profit_roi"])
             _strategy["take_profit_roi"] = min(_strategy["take_profit_roi"] + adj, _TUNE_BOUNDS["take_profit_roi"][1])
-        elif profit_rate < 0.45 or stop_rate > 0.40:
-            adj = min(0.01, _TUNE_MAX_STEP * _strategy["take_profit_roi"])
-            _strategy["take_profit_roi"] = max(_strategy["take_profit_roi"] - adj, _TUNE_BOUNDS["take_profit_roi"][0])
 
     changes = []
     for k in ("min_confidence", "take_profit_roi", "kelly_fraction"):
@@ -1908,7 +2251,8 @@ def print_status():
     print(f"  Open positions: {len(open_pos)}")
     print(f"\n  Strategy (live): confidence>={_strategy['min_confidence']:.2f}  "
           f"take_profit={_strategy['take_profit_roi']:.0%}  kelly={_strategy['kelly_fraction']:.2f}")
-    print(f"  Gates:           model_delta<={MAX_MODEL_DELTA}°  min_edge>={MIN_EDGE:.2f}  "
+    print(f"  Gates:           model_delta<={MAX_MODEL_DELTA_F}°F/{MAX_MODEL_DELTA_C}°C  "
+          f"min_edge>={MIN_EDGE:.2f}  crowd_gap<={MAX_CROWD_GAP_BUCKS:.1f} bucket(s)  "
           f"zone=[{MIN_ENTRY_PRICE:.2f},{MAX_ENTRY_PRICE:.2f}]")
 
     if open_pos:
@@ -1928,7 +2272,7 @@ def print_status():
             unrealized = round((current_price - pos["entry_price"]) * pos["shares"], 2)
             total_unrealized += unrealized
             pnl_str  = f"{'+'if unrealized>=0 else ''}{unrealized:.2f}"
-            delta_str = f" Δ={pos.get('model_delta'):.1f}{unit_sym}" if pos.get("model_delta") is not None else ""
+            delta_str = f" d={pos.get('model_delta'):.1f}{unit_sym}" if pos.get("model_delta") is not None else ""
             print(f"    {m['city_name']:<16} {m['date']} | {label:<20} | "
                   f"entry ${pos['entry_price']:.3f} -> ${current_price:.3f} | "
                   f"P={pos.get('p', 0):.0%}{delta_str} | PnL: {pnl_str}")
@@ -1937,6 +2281,106 @@ def print_status():
         print(f"\n  Unrealized PnL: {sign}{total_unrealized:.2f}")
 
     print(f"{'='*60}\n")
+
+
+def print_positions():
+    """Detailed view of every open position: shares, cost, live P&L, stops."""
+    markets  = load_all_markets()
+    open_pos = [(m, get_active_cycle(m)) for m in markets]
+    open_pos = [(m, c) for m, c in open_pos if c is not None]
+
+    if not open_pos:
+        print("\n  No open positions.\n")
+        return
+
+    print(f"\n{'='*70}")
+    mode_label = " [SIM]" if SIM_MODE else ""
+    print(f"  WEATHERBET — OPEN POSITIONS{mode_label}  ({len(open_pos)} total)")
+    print(f"{'='*70}")
+
+    total_cost       = 0.0
+    total_value      = 0.0
+    total_unrealized = 0.0
+
+    for m, pos in sorted(open_pos, key=lambda x: (x[0]["date"], x[0]["city"])):
+        unit_sym    = "F" if m["unit"] == "F" else "C"
+        city_name   = m["city_name"]
+        date        = m["date"]
+        bucket      = f"{pos['bucket_low']}-{pos['bucket_high']}{unit_sym}"
+        cycle_num   = pos["cycle_num"]
+
+        entry_price = pos["entry_price"]
+        shares      = pos["shares"]
+        cost        = pos["cost"]
+        stop_price  = pos.get("stop_price", round(entry_price * STOP_LOSS_PCT, 4))
+        tp_price    = round(entry_price * (1.0 + _strategy["take_profit_roi"]), 4)
+        trailing    = pos.get("trailing_activated", False)
+        peak        = pos.get("peak_price")
+        p           = pos.get("p", 0)
+        edge        = pos.get("edge")
+        model_delta = pos.get("model_delta")
+        opened_at   = pos.get("opened_at", "")
+
+        # Fetch live price from Gamma API; fall back to cached all_outcomes price
+        current_price = None
+        if not SIM_MODE:
+            current_price = get_market_price(pos["market_id"])
+        if current_price is None:
+            for o in m.get("all_outcomes", []):
+                if o["market_id"] == pos["market_id"]:
+                    current_price = o["price"]
+                    break
+        if current_price is None:
+            current_price = entry_price
+
+        current_value = round(current_price * shares, 2)
+        unrealized    = round((current_price - entry_price) * shares, 2)
+        roi_pct       = (current_price - entry_price) / entry_price * 100 if entry_price else 0.0
+
+        total_cost       += cost
+        total_value      += current_value
+        total_unrealized += unrealized
+
+        pnl_sign   = "+" if unrealized >= 0 else ""
+        roi_sign   = "+" if roi_pct >= 0 else ""
+
+        if trailing:
+            stop_label = f"${stop_price:.4f}  [TRAILING — peak ${peak:.3f}]"
+        else:
+            stop_label = f"${stop_price:.4f}"
+
+        delta_str = f"  model delta={model_delta:.1f}{unit_sym}" if model_delta is not None else ""
+        edge_str  = f"  edge={edge:+.3f}" if edge is not None else ""
+
+        try:
+            dt = datetime.fromisoformat(opened_at.replace("Z", "+00:00"))
+            opened_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            opened_str = opened_at or "unknown"
+
+        up_down = "UP" if unrealized >= 0 else "DOWN"
+
+        print(f"\n  {'─'*66}")
+        print(f"  {city_name:<18} {date}   {bucket}   [Cycle {cycle_num}]  [{up_down}]")
+        print(f"  {'─'*66}")
+        print(f"  Shares:        {shares:.2f}")
+        print(f"  Cost:          ${cost:.2f}")
+        print(f"  Entry price:   ${entry_price:.4f}")
+        print(f"  Current price: ${current_price:.4f}")
+        print(f"  Current value: ${current_value:.2f}   ({roi_sign}{roi_pct:.1f}% ROI)")
+        print(f"  Unrealized:    {pnl_sign}${unrealized:.2f}")
+        print(f"  Stop price:    {stop_label}")
+        print(f"  Take-profit:   ${tp_price:.4f}  (+{_strategy['take_profit_roi']:.0%})")
+        print(f"  P (model):     {p:.0%}{delta_str}{edge_str}")
+        print(f"  Opened:        {opened_str}")
+
+    total_sign = "+" if total_unrealized >= 0 else ""
+    print(f"\n  {'─'*66}")
+    print(f"  TOTALS   {len(open_pos)} positions   "
+          f"Cost: ${total_cost:.2f}   "
+          f"Value: ${total_value:.2f}   "
+          f"Unrealized: {total_sign}${total_unrealized:.2f}")
+    print(f"{'='*70}\n")
 
 
 def print_report():
@@ -1981,7 +2425,7 @@ def print_report():
         cycles   = m.get("cycles", [])
         if cycles:
             for c in cycles:
-                delta_str = f" Δ={c.get('model_delta'):.1f}" if c.get("model_delta") is not None else ""
+                delta_str = f" d={c.get('model_delta'):.1f}" if c.get("model_delta") is not None else ""
                 label  = f"{c.get('bucket_low')}-{c.get('bucket_high')}{unit_sym} C{c['cycle_num']}{delta_str}"
                 c_pnl  = f"{'+'if (c.get('pnl') or 0)>=0 else ''}{(c.get('pnl') or 0):.2f}"
                 reason = c.get("close_reason", "?")
@@ -1992,36 +2436,171 @@ def print_report():
     print(f"{'='*60}\n")
 
 # =============================================================================
+# BOOTSTRAP CALIBRATION
+# =============================================================================
+
+def bootstrap_wu_calibration(months=3):
+    """Pre-seed bias data from historical WU monthly summaries vs Open-Meteo archive hindcasts.
+
+    Runs on startup when any active city has fewer than BIAS_MIN_N bias samples.
+    Computes mean(wu_high - model_forecast) per city/source using the last `months`
+    months of WU data matched to ECMWF/GFS archive hindcasts.
+    """
+    global _cal
+    _cal = load_cal()
+
+    needs = any(
+        _cal.get(f"{city}_ecmwf_bias", {}).get("n", 0) < BIAS_MIN_N
+        for city in LOCATIONS
+        if LOCATIONS[city].get("region") in SCAN_REGIONS
+    )
+    if not needs:
+        return
+
+    print(f"  [BOOTSTRAP] Seeding bias calibration from {months} months of WU history...")
+    now     = datetime.now(timezone.utc)
+    now_str = now.isoformat()
+
+    for city_slug, loc in LOCATIONS.items():
+        if loc.get("region") not in SCAN_REGIONS:
+            continue
+        if _cal.get(f"{city_slug}_ecmwf_bias", {}).get("n", 0) >= BIAS_MIN_N:
+            continue
+
+        station   = loc["station"]
+        unit      = loc["unit"]
+        temp_unit = "fahrenheit" if unit == "F" else "celsius"
+        lat, lon  = loc["lat"], loc["lon"]
+        tz        = TIMEZONES.get(city_slug, "UTC")
+
+        # Fetch WU monthly data for last `months` months
+        wu_days = {}
+        for m_offset in range(1, months + 1):
+            target_month = now.month - m_offset
+            target_year  = now.year
+            while target_month <= 0:
+                target_month += 12
+                target_year  -= 1
+            month_str = f"{target_year}-{target_month:02d}"
+            url = f"{WU_API_URL}/weather/{station}?month={month_str}"
+            try:
+                resp = requests.get(url, timeout=(5, 15))
+                if not resp.ok:
+                    continue
+                data = resp.json()
+                for rec in data.get("daily_records", []):
+                    d   = rec.get("date")
+                    h   = rec.get("high_temp")
+                    cnt = rec.get("observation_count", 0)
+                    if d and h is not None and cnt >= 12:
+                        wu_days[d] = float(h)
+            except Exception as e:
+                print(f"  [BOOTSTRAP] {city_slug} {month_str}: {e}")
+
+        if len(wu_days) < BIAS_MIN_N:
+            continue
+
+        dates_sorted = sorted(wu_days.keys())
+        start_date   = dates_sorted[0]
+        end_date     = dates_sorted[-1]
+
+        # Fetch ECMWF and GFS archive hindcasts
+        archives = {}
+        for model_api, source_key in [("ecmwf_ifs", "ecmwf"), ("gfs_seamless", "hrrr")]:
+            archive_url = (
+                f"https://archive-api.open-meteo.com/v1/archive"
+                f"?latitude={lat}&longitude={lon}"
+                f"&start_date={start_date}&end_date={end_date}"
+                f"&daily=temperature_2m_max&temperature_unit={temp_unit}"
+                f"&timezone={tz}&models={model_api}"
+            )
+            try:
+                resp = requests.get(archive_url, timeout=(10, 30))
+                data = resp.json()
+                if "error" in data:
+                    print(f"  [BOOTSTRAP] {city_slug} {model_api}: {data.get('reason', 'API error')}")
+                    continue
+                daily    = data.get("daily", {})
+                day_map  = {}
+                for d, t in zip(daily.get("time", []), daily.get("temperature_2m_max", [])):
+                    if t is not None:
+                        day_map[d] = round(t) if unit == "F" else round(t, 1)
+                archives[source_key] = day_map
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"  [BOOTSTRAP] {city_slug} {model_api} archive: {e}")
+
+        # Compute mean bias per source
+        for source_key, archive in archives.items():
+            residuals = [wu_days[d] - archive[d] for d in wu_days if d in archive]
+            if len(residuals) < BIAS_MIN_N:
+                continue
+            mean_bias = round(sum(residuals) / len(residuals), 3)
+            bias_key  = f"{city_slug}_{source_key}_bias"
+            _cal[bias_key] = {"bias": mean_bias, "n": len(residuals), "updated_at": now_str}
+            print(f"  [BOOTSTRAP] {loc['name']} {source_key}: bias={mean_bias:+.2f} (n={len(residuals)})")
+
+    CALIBRATION_FILE.write_text(json.dumps(_cal, indent=2), encoding="utf-8")
+    print(f"  [BOOTSTRAP] Done.")
+
+# =============================================================================
 # MAIN LOOP
 # =============================================================================
 
 def main():
-    if len(sys.argv) > 1:
-        cmd = sys.argv[1].lower()
-        if cmd == "status":
-            print_status()
+    # Strip --sim flag so remaining positional args are the subcommand
+    positional = [a for a in sys.argv[1:] if not a.startswith("--")]
+    cmd = positional[0].lower() if positional else None
+
+    if cmd == "status":
+        print_status()
+        return
+    if cmd == "report":
+        print_report()
+        return
+    if cmd == "positions" or "--positions" in sys.argv:
+        print_positions()
+        return
+    if cmd == "sim-reset":
+        if not SIM_MODE:
+            print("sim-reset requires --sim flag: python bot_v4.py --sim sim-reset")
             return
-        if cmd == "report":
-            print_report()
-            return
+        if SIM_STATE_FILE.exists():
+            SIM_STATE_FILE.unlink()
+        wiped = 0
+        for f in SIM_MARKETS_DIR.glob("*.json"):
+            f.unlink()
+            wiped += 1
+        print(f"[SIM] Reset complete — removed {wiped} market file(s) and state. Run with --sim to start fresh.")
+        return
+    if cmd is not None:
         print(f"Unknown command: {cmd}")
-        print("Usage: python bot_v4.py [status|report]")
+        print("Usage: python bot_v4.py [--sim] [status|report|positions|sim-reset]")
         return
 
+    sim_label = " [SIM MODE]" if SIM_MODE else ""
     print(f"\n{'='*60}")
-    print(f"  WEATHERBET — Starting (v4 Rewrite)")
+    print(f"  WEATHERBET — Starting (v4 Rewrite){sim_label}")
     print(f"  Regions: {sorted(SCAN_REGIONS)}")
+    print(f"  WU API: {'OK' if WU_API_VALID else 'UNAVAILABLE'} ({WU_API_URL})")
     print(f"  Strategy: take_profit={_strategy['take_profit_roi']:.0%}  "
           f"kelly={_strategy['kelly_fraction']:.2f}  confidence>={_strategy['min_confidence']:.2f}")
-    print(f"  Entry gates: model_delta<={MAX_MODEL_DELTA}°  min_edge>={MIN_EDGE:.2f}  "
+    print(f"  Entry gates: model_delta<={MAX_MODEL_DELTA_F}°F/{MAX_MODEL_DELTA_C}°C  "
+          f"min_edge>={MIN_EDGE:.2f}  crowd_gap<={MAX_CROWD_GAP_BUCKS:.1f} bucket(s)  "
           f"zone=[{MIN_ENTRY_PRICE:.2f},{MAX_ENTRY_PRICE:.2f}]")
-    print(f"  Stop-loss: {(1-STOP_LOSS_PCT)*100:.0f}%  Trailing: activates at +20%")
+    print(f"  Loss exit: forecast-divergence (>0.5 units outside bucket)  "
+          f"Trailing: +25% activation, 30% below peak")
     print(f"  Scan: every {SCAN_INTERVAL//60}min  Monitor: every {MONITOR_INTERVAL//60}min")
+    if SIM_MODE:
+        print(f"  ** No real orders placed — virtual balance ${SIM_BALANCE:.2f} **")
     print(f"  No forecast-based exits — price-only stop/take-profit")
     print(f"{'='*60}\n")
 
     global _cal
     _cal = load_cal()
+
+    if WU_API_VALID:
+        bootstrap_wu_calibration(months=3)
 
     last_scan    = 0.0
     last_monitor = 0.0
@@ -2043,11 +2622,12 @@ def main():
             print(f"  Scan complete — opened: {new_pos}, closed: {closed}, resolved: {resolved}")
 
             # Print brief balance summary after each scan
-            state = load_state()
-            bal   = state["balance"]
-            start = state["starting_balance"]
-            roi   = (bal - start) / start * 100
-            print(f"  Balance: ${bal:.2f} ({'+'if roi>=0 else ''}{roi:.1f}% vs start)\n")
+            state     = load_state()
+            bal       = state["balance"]
+            start     = state["starting_balance"]
+            roi       = (bal - start) / start * 100
+            bal_label = "[SIM] Balance" if SIM_MODE else "Balance"
+            print(f"  {bal_label}: ${bal:.2f} ({'+'if roi>=0 else ''}{roi:.1f}% vs start)\n")
 
         time.sleep(30)
 

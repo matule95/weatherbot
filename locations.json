@@ -1,0 +1,78 @@
+[
+  {
+    "id": "nyc",
+    "url": "https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA"
+  },
+  {
+    "id": "chicago",
+    "url": "https://www.wunderground.com/history/daily/us/il/chicago/KORD"
+  },
+  {
+    "id": "miami",
+    "url": "https://www.wunderground.com/history/daily/us/fl/miami/KMIA"
+  },
+  {
+    "id": "dallas",
+    "url": "https://www.wunderground.com/history/daily/us/tx/dallas/KDAL"
+  },
+  {
+    "id": "seattle",
+    "url": "https://www.wunderground.com/history/daily/us/wa/seatac/KSEA"
+  },
+  {
+    "id": "atlanta",
+    "url": "https://www.wunderground.com/history/daily/us/ga/atlanta/KATL"
+  },
+  {
+    "id": "london",
+    "url": "https://www.wunderground.com/history/daily/gb/london/EGLC"
+  },
+  {
+    "id": "paris",
+    "url": "https://www.wunderground.com/history/daily/fr/paris/LFPG"
+  },
+  {
+    "id": "munich",
+    "url": "https://www.wunderground.com/history/daily/de/munich/EDDM"
+  },
+  {
+    "id": "ankara",
+    "url": "https://www.wunderground.com/history/daily/tr/%C3%A7ubuk/LTAC"
+  },
+  {
+    "id": "seoul",
+    "url": "https://www.wunderground.com/history/daily/kr/incheon/RKSI"
+  },
+  {
+    "id": "tokyo",
+    "url": "https://www.wunderground.com/history/daily/jp/tokyo/RJTT"
+  },
+  {
+    "id": "shanghai",
+    "url": "https://www.wunderground.com/history/daily/cn/shanghai/ZSPD"
+  },
+  {
+    "id": "singapore",
+    "url": "https://www.wunderground.com/history/daily/sg/singapore/WSSS"
+  },
+  {
+    "id": "lucknow",
+    "url": "https://www.wunderground.com/history/daily/in/lucknow/VILK"
+  },
+  {
+    "id": "toronto",
+    "url": "https://www.wunderground.com/history/daily/ca/mississauga/CYYZ"
+  },
+  {
+    "id": "sao-paulo",
+    "url": "https://www.wunderground.com/history/daily/br/guarulhos/SBGR"
+  },
+  {
+    "id": "buenos-aires",
+    "url": "https://www.wunderground.com/history/daily/ar/ezeiza/SAEZ"
+  },
+  {
+    "id": "wellington",
+    "url": "https://www.wunderground.com/history/daily/nz/wellington/NZWN"
+  }
+]
