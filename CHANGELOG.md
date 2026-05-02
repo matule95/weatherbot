@@ -9,6 +9,85 @@ canonical description of how the bot currently works.
 
 ---
 
+## v4.14 — Trailing-Stop Tightening + Constants Move to Config (2026-05-02)
+
+### Why This Change Was Made
+
+After 24h of v4.13 sim data — 31 trades opened, 21 closed, win rate 57.1%, realized PnL +$19.04 — one specific failure pattern stood out: **all 3 trailing-stop exits were losers** (avg PnL −$2.45), totaling −$7.36 of drag.
+
+Forensic detail on the trailing-stop closes:
+
+| City | Entry | Peak | Calc'd trail (peak×0.70) | Actual exit | PnL |
+|---|---|---|---|---|---|
+| london 5/2 | $0.237 | $0.298 | $0.209 | $0.163 | −$3.07 |
+| toronto 5/2 | $0.240 | $0.320 | $0.224 | $0.190 | −$2.72 |
+| toronto 5/3 | $0.240 | $0.320 | $0.224 | $0.220 | −$1.57 |
+
+Two issues:
+
+**1. The math at 0.30 trail is structurally lossy**: Trailing arms at +25% (entry × 1.25). With a 30% trail, the stop sits at peak × 0.70 = entry × 0.875 → exit at **−12.5% net** in the worst case. A position can climb to +25%, the trail arms, a routine forecast wobble drops price back toward entry, and we exit at a guaranteed loss. We were converting would-be flat trades into structural losers.
+
+**2. Polymarket bestBid step volatility amplifies the problem**: Two of three exits fired well below the calculated trail (15–22% below) because thinly-traded bucket markets have wide bid-ask spreads — bestBid can step from $0.21 to $0.16 on a single trade. This isn't fixable by tightening alone, but a tighter trail means the stop is closer to the peak when bid steps catch us.
+
+### Why Sim and Live Now Look Identical (Sim-Mode Audit)
+
+A side-investigation of why sim was producing these "exit-below-trail" cases ruled out a sim-fidelity issue: `monitor_positions()` already runs every 5 minutes in **both** sim and live modes. The only sim-specific skip is the orphan-reconcile section ([bot_v4.py:1911](bot_v4.py#L1911)), which is correct because sim has no on-chain state to reconcile. Sim fetches live `bestBid` from Polymarket every 5 minutes, fires exits on those prices, and behaves identically to live for entry/exit decision-making. The only deliberate sim/live divergences are:
+
+- order placement (paper response vs CLOB call)
+- token/wallet balance source (tracked JSON vs on-chain)
+- orphan reconciliation (no chain state in sim)
+
+Behaviorally, sim is faithful. The trailing-stop late-exits are real Polymarket microstructure, not simulation artifact, so they will happen in live too. Tightening trail addresses both.
+
+### Config Changes
+
+| Parameter | Old | New | Reason |
+|---|---|---|---|
+| `trailing_distance` | 0.30 (hardcoded) | **0.20** (config) | Locks in profit at peak instead of giving back to loss. At entry×1.25 peak: −12.5% → 0% (breakeven). At entry×1.40 peak: −2% → +12% locked |
+| `trailing_activation` | 1.25 (hardcoded) | 1.25 (config, unchanged) | Moved to config for tunability without code change |
+
+### What Did NOT Change
+
+- **`take_profit_roi = 0.50`** — 3/3 TPs in v4.13 captured +$11.74 avg. Lowering would shrink the big wins; sample too small to act on.
+- **`forecast_diverged()` tolerance (0.5°)** — 14 of 15 forecast_diverged exits were near-flat (+$0.24 net combined). Only the buenos-aires 5/2 outlier (−$9.07, gapped to $0.005 at exit) was a tail event. Tightening would produce more exits on noise; the central tendency is correct.
+- **All entry gates from v4.13** — producing the right volume at the right edge distribution. Win rate 57% beats expected calibrated 43%, so the model is conservative. No reason to touch.
+- **Bias correction logic** — Lucknow 2026-05-03 is currently −63.9% with bias-corrected forecast still in-bucket while raw ECMWF/GFS show 38°C. This will resolve Tuesday and tell us whether the bias correction is right or wrong. Don't touch until we have data.
+
+### Expected Impact
+
+On the v4.13 sample, replacing each trailing-stop exit at the new 0.20 trail:
+- london 5/2: peak $0.298 → trail $0.238 → at minimum +0% (vs −31% actual). Probably exits at +5–10%.
+- toronto 5/2: peak $0.320 → trail $0.256 → at minimum +6.7% (vs −20% actual). Probably +5–10%.
+- toronto 5/3: peak $0.320 → trail $0.256 → at minimum +6.7% (vs −8% actual). Probably +5–10%.
+
+Estimated swing: ~+$10–12 of PnL recovered on the ~3 trailing exits per 24h. At v4.13's pace of 21 closes/day, this is +$10/day improvement. Compounds with v4.13's existing +$19/day baseline.
+
+### Current System State
+
+```python
+# Entry gates (unchanged from v4.13):
+min_confidence       = 0.42
+max_model_delta_f    = 2.0
+max_model_delta_c    = 2.0
+max_crowd_gap_buckets = 1.5
+min_edge             = 0.10
+min_entry_price      = 0.10
+max_entry_price      = 0.65
+
+# Exit logic (v4.14):
+forecast_diverged(forecast, t_low, t_high, tolerance=0.5)
+take_profit_roi      = 0.50
+trailing_activation  = 1.25 × entry           # now in config
+trailing_distance    = 0.20 of peak            # was 0.30, now in config
+
+# Position sizing (unchanged):
+kelly_fraction       = 0.50
+max_bet              = 40.0
+max_open_positions   = 15
+```
+
+---
+
 ## v4.13 — Entry-Gate Recalibration for Volume (2026-05-01)
 
 ### Why This Change Was Made
