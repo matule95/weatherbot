@@ -131,8 +131,8 @@ POLY_FUNDER         = _cfg.get("polymarket_funder", "")
 POLY_CHAIN_ID       = _cfg.get("chain_id", 137)
 POLY_SIG_TYPE       = _cfg.get("signature_type", 0)
 
-SIGMA_F       = 1.5   # default forecast sigma in Fahrenheit (ECMWF 24h max-temp accuracy ~±1.5°F)
-SIGMA_C       = 0.85  # default forecast sigma in Celsius
+SIGMA_F       = _cfg.get("sigma_f", 2.5)   # fallback prior — per-city values from calibration override this
+SIGMA_C       = _cfg.get("sigma_c", 2.0)   # fallback prior — per-city values from calibration override this
 SIGMA_METAR_C = 1.0   # METAR is a real observation — tighter sigma
 SIGMA_METAR_F = 1.5
 
@@ -2449,22 +2449,27 @@ def bootstrap_wu_calibration(months=3):
     global _cal
     _cal = load_cal()
 
-    needs = any(
-        _cal.get(f"{city}_ecmwf_bias", {}).get("n", 0) < BIAS_MIN_N
-        for city in LOCATIONS
-        if LOCATIONS[city].get("region") in SCAN_REGIONS
-    )
+    def _city_needs_bootstrap(city):
+        for src in ("ecmwf", "hrrr"):
+            if _cal.get(f"{city}_{src}_bias", {}).get("n", 0) < BIAS_MIN_N:
+                return True
+            if _cal.get(f"{city}_{src}", {}).get("sigma") is None:
+                return True
+        return False
+
+    needs = any(_city_needs_bootstrap(city) for city in LOCATIONS
+                if LOCATIONS[city].get("region") in SCAN_REGIONS)
     if not needs:
         return
 
-    print(f"  [BOOTSTRAP] Seeding bias calibration from {months} months of WU history...")
+    print(f"  [BOOTSTRAP] Seeding bias+sigma calibration from {months} months of WU history...")
     now     = datetime.now(timezone.utc)
     now_str = now.isoformat()
 
     for city_slug, loc in LOCATIONS.items():
         if loc.get("region") not in SCAN_REGIONS:
             continue
-        if _cal.get(f"{city_slug}_ecmwf_bias", {}).get("n", 0) >= BIAS_MIN_N:
+        if not _city_needs_bootstrap(city_slug):
             continue
 
         station   = loc["station"]
@@ -2530,15 +2535,30 @@ def bootstrap_wu_calibration(months=3):
             except Exception as e:
                 print(f"  [BOOTSTRAP] {city_slug} {model_api} archive: {e}")
 
-        # Compute mean bias per source
+        # Compute mean bias and observed sigma per source
         for source_key, archive in archives.items():
             residuals = [wu_days[d] - archive[d] for d in wu_days if d in archive]
             if len(residuals) < BIAS_MIN_N:
                 continue
-            mean_bias = round(sum(residuals) / len(residuals), 3)
+            n      = len(residuals)
+            errors = [abs(r) for r in residuals]
+            prior  = SIGMA_F if unit == "F" else SIGMA_C
+
             bias_key  = f"{city_slug}_{source_key}_bias"
-            _cal[bias_key] = {"bias": mean_bias, "n": len(residuals), "updated_at": now_str}
-            print(f"  [BOOTSTRAP] {loc['name']} {source_key}: bias={mean_bias:+.2f} (n={len(residuals)})")
+            sigma_key = f"{city_slug}_{source_key}"
+
+            # Bias (mean signed residual: positive = model runs cold vs WU truth)
+            if _cal.get(bias_key, {}).get("n", 0) < n:
+                mean_bias = round(sum(residuals) / n, 3)
+                _cal[bias_key] = {"bias": mean_bias, "n": n, "updated_at": now_str}
+                print(f"  [BOOTSTRAP] {loc['name']} {source_key}: bias={mean_bias:+.2f} (n={n})")
+
+            # Sigma (Bayesian-blended MAE, matches run_calibration's formula)
+            if _cal.get(sigma_key, {}).get("sigma") is None:
+                mae       = sum(errors) / n
+                bay_sigma = round((PRIOR_WEIGHT * prior + n * mae) / (PRIOR_WEIGHT + n), 3)
+                _cal[sigma_key] = {"sigma": bay_sigma, "n": n, "updated_at": now_str}
+                print(f"  [BOOTSTRAP] {loc['name']} {source_key}: sigma={bay_sigma:.2f} (n={n})")
 
     CALIBRATION_FILE.write_text(json.dumps(_cal, indent=2), encoding="utf-8")
     print(f"  [BOOTSTRAP] Done.")

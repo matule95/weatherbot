@@ -9,6 +9,124 @@ canonical description of how the bot currently works.
 
 ---
 
+## v4.15 — Sigma Audit + Per-City Calibration Bootstrap (2026-05-03)
+
+### Why This Change Was Made
+
+After 48 hours of v4.13/v4.14 sim data — 45 trades, 38 closed, win rate 47.4%, realized PnL **−$4.16** — the bot stopped showing edge. v4.13's first 24h was strongly profitable (+$19.04, WR 57%), but the next 24h was equally negative (−$23.20, WR 35%). Reversion to mean rather than a sustained edge.
+
+A data audit cross-checking every closed cycle's forecast against actual WU observations revealed the root cause was deeper than entry gates:
+
+#### Forecast errors are 3-7°, not 0.85-1.5°
+
+| City | Date | Forecast | Actual | Error |
+|---|---|---|---|---|
+| Lucknow | 5/3 | 37.1°C | **32°C** | **5.1°C** |
+| Shanghai | 5/4 | 23.1°C | **16°C** | **7.1°C** |
+| Tokyo | 5/4 | 26.0°C | **21°C** | **5.0°C** |
+| Atlanta | 5/2 | 65.2°F | **72°F** | **6.8°F** |
+| Sao-paulo | 5/3 | 21.9°C | 19°C | 2.9°C |
+| (15 C-city samples) | | | | RMSE = **3.06°C** |
+| (4 F-city samples) | | | | RMSE = **3.59°F** |
+
+Configured sigmas: `SIGMA_C = 0.85`, `SIGMA_F = 1.5`. **Actual forecast errors are roughly 3.5x larger than the bot believed.**
+
+#### What this meant in practice
+
+With sigma=0.85 for a 1°C bucket centered on the forecast, the bot computed bucket probability ≈ 0.44 (max possible). With true sigma=3.0, the actual probability of that same bucket resolving YES is closer to 0.13. The bot was systematically:
+
+- **Inflating edge estimates** — believing +0.20 edge when actual edge was zero or negative
+- **Oversizing Kelly bets** — high "edges" justified large bets, amplifying losses
+- **Letting marginal trades through gates** — min_confidence=0.42 was easy to clear at the wrong sigma but mathematically appropriate at the right sigma
+
+The 47% observed win rate is exactly what you'd expect when "edge" calculations are illusory: random-walk performance.
+
+### Why Some Trades Still Worked
+
+Tokyo's only big win was on **`≥25°C` (open-ended top bucket)** at +$22 — open-ended buckets cover wide temperature ranges and are robust to forecast errors of 3-5°. Single-bucket entries (1° wide) require sigma well below the bucket width to be reliably correct. Historical winners (Tokyo, atlanta exits-before-resolve) shared this pattern: either open-ended buckets, or fast forecast_diverged exits caught early movement.
+
+### What Changed
+
+#### Config Changes
+
+| Parameter | Old | New | Reason |
+|---|---|---|---|
+| `sigma_f` | 1.5 (hardcoded) | **2.5** (config) | Match observed F-city forecast errors (~3.6° RMSE). Used as fallback prior; per-city calibration overrides. |
+| `sigma_c` | 0.85 (hardcoded) | **2.0** (config) | Match observed C-city forecast errors (~3.0° RMSE). Used as fallback prior; per-city calibration overrides. |
+| `min_confidence` | 0.42 | **0.50** | At new sigma_c=2.0, single-bucket entries cap at p≈0.20 — unreachable under 0.50. **Intentionally bans single-bucket trades**, the dominant loss source. Open-ended bucket entries still pass when forecast is at the market's extreme. |
+| `kelly_fraction` | 0.50 | **0.25** | Safety damper while new calibration is validated. Raise back toward 0.50 once 30+ closed cycles confirm the recalibration produces real edge. |
+
+#### Code Changes
+
+**`bootstrap_wu_calibration()` now seeds per-city sigma alongside bias** ([bot_v4.py:2442](bot_v4.py#L2442)). Previously it computed only `<city>_<source>_bias` from the 90-day WU + Open-Meteo archive sample; now it also computes `<city>_<source>` (the sigma key already read by `get_sigma()`) using the same Bayesian-blended MAE formula as `run_calibration()`.
+
+The bootstrap gate was upgraded to detect when bias or sigma is missing (previously checked bias only). On next startup, every active city will have its sigma computed from 90 days of historical forecast-vs-WU error.
+
+`SIGMA_F` and `SIGMA_C` constants moved from hardcoded values to `_cfg.get("sigma_f", 2.5)` / `_cfg.get("sigma_c", 2.0)` ([bot_v4.py:134-135](bot_v4.py#L134-L135)). They're still used as Bayesian priors in calibration; with PRIOR_WEIGHT=3 and n=90 sample days, the prior contributes <5% to the final per-city sigma, so the constants are mostly safety nets.
+
+### Why Existing Data Is Preserved
+
+- **Open positions**: continue with their stored entry parameters (entry_price, sigma at entry). Exit logic doesn't depend on the live sigma, so behavior is unchanged for them.
+- **`calibration.json`**: 90 days of bias data preserved. Bootstrap will *add* sigma keys without modifying existing bias entries.
+- **`sim_state.json`**, **`sim_markets/*.json`**: untouched. Cumulative PnL, snapshots, and history all preserved.
+
+The only thing that changes is the gate behavior for *new* entries on the next scan after restart.
+
+### What Did NOT Change
+
+- **Trailing logic** (v4.14: 0.20 distance, 1.25 activation) — working correctly per closed cycles.
+- **`forecast_diverged()` tolerance** (0.5) — bounded-loss thesis still valid; the issue was upstream (entries that shouldn't have happened), not the exit.
+- **`take_profit_roi`** (0.50) — TP wins still capture meaningful profit.
+- **Entry gates other than min_confidence** — model_delta, crowd_gap, min_edge unchanged. Wider sigma already filters most marginal entries via the confidence floor.
+- **Bias correction** — the residual analysis showed bias values are reasonable; bias correction itself isn't the problem. The problem was the bot believed its bias-corrected blend with too-tight uncertainty.
+
+### Expected Impact
+
+Entry volume drops sharply — single-bucket C-city trades (the majority of v4.13/v4.14 entries) are now blocked. Expect:
+
+- 5-10 entries/day instead of 17-20
+- Most entries on open-ended buckets where forecast lands at market extreme
+- Average bet size halved by the kelly_fraction reduction
+- WR should rise above 55% if the new calibration is honest
+- Daily PnL swing reduced (smaller bets, fewer trades), but net PnL trajectory should turn positive
+
+This trades *learning speed* (more trades = faster signal) for *capital preservation* (smaller bets, fewer false-edge trades). The bot will need 5-10 days to produce 30+ closed cycles for the next confidence-level reassessment.
+
+### Followup To Watch
+
+1. **Bootstrap output** — on first restart, look for `[BOOTSTRAP] {city} {source}: sigma={value} (n=...)` lines confirming per-city sigmas are seeded.
+2. **Per-city sigma values** — should land in the 1.5-3.5 range for most cities. Lucknow specifically should show wider sigma reflecting its high observed errors.
+3. **WR by entry type** — open-ended bucket entries should win >55%. If they don't, the issue is calibration depth (recency), not just sigma scale.
+4. **Tuner re-enable** — keep `tune_enabled: false` until 30+ closed cycles under v4.15 confirm the recalibration is stable.
+
+### Current System State
+
+```python
+# Entry gates (v4.15):
+min_confidence       = 0.50    # was 0.42 — banned single-bucket entries by design
+max_model_delta_f    = 2.0
+max_model_delta_c    = 2.0
+max_crowd_gap_buckets = 1.5
+min_edge             = 0.10
+
+# Forecast uncertainty (v4.15):
+sigma_f              = 2.5     # was 1.5 hardcoded — fallback prior; per-city calibrated
+sigma_c              = 2.0     # was 0.85 hardcoded — fallback prior; per-city calibrated
+# Per-city sigma seeded from 90 days of WU + Open-Meteo archive on bootstrap
+
+# Position sizing (v4.15):
+kelly_fraction       = 0.25    # was 0.50 — safety damper during calibration validation
+max_bet              = 40.0
+
+# Exit logic (unchanged from v4.14):
+forecast_diverged(forecast, t_low, t_high, tolerance=0.5)
+take_profit_roi      = 0.50
+trailing_activation  = 1.25
+trailing_distance    = 0.20
+```
+
+---
+
 ## v4.14 — Trailing-Stop Tightening + Constants Move to Config (2026-05-02)
 
 ### Why This Change Was Made
